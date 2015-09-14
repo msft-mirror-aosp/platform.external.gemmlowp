@@ -24,6 +24,7 @@
 namespace std {
 using ::uint8_t;
 using ::int32_t;
+using ::int64_t;
 }
 #endif
 
@@ -45,13 +46,19 @@ namespace eight_bit_int_gemm {
 // should use the main gemmlowp interface (public/gemmlowp.h) instead.
 
 // The main entry point to compute a Gemm. This is the standard
+enum class BitDepthSetting {
+  A8B8,  // 8-bit a, 8-bit b
+  A5B7   // 5-bit a, 7-bit b
+};
+
+// The main entry point to compute a Gemm. This is the standard
 // EightBitIntGemm interface.
 void EightBitIntGemm(bool transpose_a, bool transpose_b, bool transpose_c,
                      int m, int n, int k, const std::uint8_t *a,
                      std::int32_t a_offset, int lda, const std::uint8_t *b,
                      std::int32_t b_offset, int ldb, std::uint8_t *c,
                      std::int32_t c_offset, std::int32_t c_mult_int,
-                     std::int32_t c_shift, int ldc);
+                     std::int32_t c_shift, int ldc, BitDepthSetting bit_depth);
 
 // Frees any persistent resources
 // (threads, thread pools, allocators, buffers, ...)

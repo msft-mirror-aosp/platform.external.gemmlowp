@@ -4,6 +4,12 @@ gemmlowp: a small self-contained low-precision GEMM library
 This is not a full linear algebra library, only a GEMM library: it only does
 general matrix multiplication ("GEMM").
 
+The meaning of "low precision" is detailed in this document:
+  doc/low-precision.txt
+
+Some of the general design is explained in
+  doc/design.txt
+
 
 Disclaimer
 ==========
@@ -27,10 +33,30 @@ Required for some features:
     * sysconf (for multi-threaded operation to detect number of cores;
                may be bypassed).
 
-Optional optimized code paths:
-At the moment, we only have optimized code paths for ARM NEON SIMD.
+Optional:
+  Architecture-specific code paths use intrinsics or inline assembly.
+  See "Architecture-specific optimized code paths" below.
+
+Architecture-specific optimized code paths
+==========================================
+
+We have some optimized code paths for specific instruction sets.
 Some are written in inline assembly, some are written in C++ using
 intrinsics. Both GCC and Clang are supported.
+
+At the moment, we have a full set of optimized code paths (kernels,
+packing and unpacking paths) only for ARM NEON, supporting both
+ARMv7 (32bit) and ARMv8 (64bit).
+
+We also have a partial set of optimized code paths (only kernels
+at the moment) for Intel SSE. It supports both x86 and x86-64 but
+only targets SSE4. The lack of packing/unpacking code paths means
+that performance isn't optimal yet.
+
+Details of what it takes to make an efficient port of gemmlowp, namely
+writing a suitable GEMM kernel and accompanying packing code, are
+explained in this file:
+  doc/kernels.txt
 
 
 Public interfaces
@@ -55,14 +81,62 @@ Public interfaces
     eight_bit_int_gemm/eight_bit_int_gemm.cc.
 
 
+Building
+========
+
+Building by manually invoking your compiler
+-------------------------------------------
+
+Because gemmlowp is so simple, working with it involves only
+single-command-line compiler invokations. Therefore we expect that
+most people working with gemmlowp will either manually invoke their
+compiler, or write their own rules for their own preferred build
+system.
+
+Keep in mind (previous section) that gemmlowp itself is a pure-headers-only
+library so there is nothing to build, and the eight_bit_int_gemm library
+consists of a single eight_bit_int_gemm.cc file to build.
+
+For a Android gemmlowp development workflow, the scripts/ directory
+contains a script to build and run a program on an Android device:
+  scripts/test-android.sh
+
+Building using Bazel
+--------------------
+
+That being said, we also maintain a Bazel BUILD system as part of
+gemmlowp. Its usage is not mandatory at all and is only one
+possible way that gemmlowp libraries and tests may be built. If
+you are interested, Bazel's home page is
+  http://bazel.io/
+And you can get started with using Bazel to build gemmlowp targets
+by first creating an empty WORKSPACE file in a parent directory,
+for instance:
+
+$ cd gemmlowp/..  # change to parent directory containing gemmlowp/
+$ touch WORKSPACE # declare that to be our workspace root
+$ bazel build gemmlowp:all
+
+
 Testing
 =======
+
+Testing by manually building and running tests
+----------------------------------------------
 
 The test/ directory contains unit tests. The primary unit test is
   test/test.cc
 Since it covers also the EightBitIntGemm interface, it needs to be
 linked against
   eight_bit_int_gemm/eight_bit_int_gemm.cc
+It also uses realistic data captured from a neural network run in
+  test/test_data.cc
+
+Thus you'll want to pass the following list of source files to your
+compiler/linker:
+  test/test.cc
+  eight_bit_int_gemm/eight_bit_int_gemm.cc
+  test/test_data.cc
 
 The scripts/ directory contains a script to build and run a program
 on an Android device:
@@ -77,7 +151,20 @@ $ export CXX=/some/toolchains/arm-linux-androideabi-4.8/bin/arm-linux-androideab
 
 Then run:
 
-$ ./scripts/test-android.sh test/test.cc eight_bit_int_gemm/eight_bit_int_gemm.cc
+$ ./scripts/test-android.sh \
+test/test.cc \
+eight_bit_int_gemm/eight_bit_int_gemm.cc \
+test/test_data.cc
+
+
+Testing using Bazel
+-------------------
+
+Alternatively, you can use Bazel to build and run tests. See the Bazel
+instruction in the above section on building. Once your Bazel workspace
+is set up, you can for instance do:
+
+$ bazel test gemmlowp:all
 
 
 Troubleshooting Compilation
@@ -105,12 +192,18 @@ arm-linux-androideabi-g++ that does include NEON.
 Benchmarking
 ============
 
-To see what the performance is like on some typical operations, run
-$ ../scripts/test-android.sh benchmark.cc
+The main benchmark is
+  benchmark.cc
+It doesn't need to be linked to any
+other source file. We recommend building with assertions disabled (-DNDEBUG).
 
-This will compile and run a small benchmark binary, which runs through GEMMs
-with varying input matrix sizes and outputs the performance. The final test
-simulates the sort of GEMM sizes you'd expect for a GoogLeNet-style CNN.
+For example, the benchmark can be built and run on an Android device by doing:
+
+$ ./scripts/test-android.sh test/benchmark.cc -DNDEBUG
+
+If GEMMLOWP_TEST_PROFILE is defined then the benchmark will be built with
+profiling instrumentation (which makes it slower) and will dump profiles.
+See next section on profiling.
 
 
 Profiling
@@ -124,24 +217,8 @@ See profiling/instrumentation.h.
 A full example of using this profiler is given in profiling/profiler.h.
 
 
-Low-precision?
-==============
-
-"Low-precision" means that the input and output matrix entries are integers
-on at most 8 bits. The scalar type is uint8_t.
-
-This isn't the same as just doing plain matrix arithmetic over uint8_t,
-because that would overflow. To avoid overflow, we internally accumulate
-results on more than 8 bits, and at the end we keep only some significant
-8 bits. This relies on the caller providing suitable offset/multiplier/shift
-parameters, which effectively govern how we extract some significant 8 bit
-from our more-than-8bit temporary accumulators. See the extra function
-parameters taken by Gemm() in public/gemmlowp.h or by EightBitIntGemm() in
-eight_bit_int_gemm/eight_bit_int_gemm.h.
-
-
 Performance goals
-============================
+=================
 
 Our performance goals differ from typical GEMM performance goals in the
 following ways:

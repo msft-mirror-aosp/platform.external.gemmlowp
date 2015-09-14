@@ -18,6 +18,7 @@
 #define GEMMLOWP_INTERNAL_KERNEL_H_
 
 #include "common.h"
+#include "../public/bit_depth.h"
 
 namespace gemmlowp {
 
@@ -183,8 +184,8 @@ inline int OffsetIntoCell(int w, int d) {
       return d + w * CellFormat::kDepth;
     case CellOrder::Diagonal:
       assert(CellFormat::kWidth == CellFormat::kDepth);
-      static const int cell_width = CellFormat::kWidth;
-      return w + ((d + cell_width - w) % cell_width) * cell_width;
+      static const int size = CellFormat::kWidth;
+      return ((size + w - d) * size + d) % (size * size);
     default:
       assert(false);
       return 0;
@@ -205,9 +206,6 @@ struct KernelBase {
                    int dst_col_stride, const std::uint8_t* lhs_ptr,
                    const std::uint8_t* rhs_ptr, int start_depth,
                    int run_depth) const = 0;
-
-  static const int kLhsBitDepth = 8;
-  static const int kRhsBitDepth = 8;
 
   virtual ~KernelBase() {}
 };

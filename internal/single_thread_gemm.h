@@ -38,8 +38,8 @@ class SingleThreadGemmContext {
   Allocator allocator_;
 };
 
-template <typename KernelFormat, typename Scalar, MapOrder LhsOrder,
-          MapOrder RhsOrder, MapOrder ResultOrder>
+template <typename KernelFormat, typename Scalar, BitDepthSetting BitDepth,
+          MapOrder LhsOrder, MapOrder RhsOrder, MapOrder ResultOrder>
 void SingleThreadGemm(SingleThreadGemmContext* context,
                       const KernelBase& kernel,
                       const MatrixMap<const Scalar, LhsOrder>& lhs,
@@ -60,40 +60,41 @@ void SingleThreadGemm(SingleThreadGemmContext* context,
   BlockParams block_params;
   block_params.Init<KernelFormat>(rows, cols, depth, 1);
 
-  PackedSideBlock<typename KernelFormat::Lhs> packed_lhs(
-      Side::Lhs, allocator, block_params, rhs_offset);
-  PackedSideBlock<typename KernelFormat::Rhs> packed_rhs(
-      Side::Rhs, allocator, block_params, lhs_offset);
+  PackedSideBlock<typename KernelFormat::Lhs>
+      packed_lhs(Side::Lhs, allocator, block_params, rhs_offset);
+  PackedSideBlock<typename KernelFormat::Rhs>
+      packed_rhs(Side::Rhs, allocator, block_params, lhs_offset);
 
-  PackedResultInt32 packed_result(allocator, block_params);
+  PackedResult packed_result(allocator, block_params);
 
   allocator->Commit();
 
   const bool pack_rhs_once = block_params.l2_cols == cols;
 
   if (pack_rhs_once) {
-    PackRhs(&packed_rhs, rhs);
+    PackRhs<BitDepth>(&packed_rhs, rhs);
   }
 
   for (int r = 0; r < rows; r += block_params.l2_rows) {
     int rs = std::min(block_params.l2_rows, rows - r);
 
-    PackLhs(&packed_lhs, lhs.block(r, 0, rs, depth));
+    PackLhs<BitDepth>(&packed_lhs, lhs.block(r, 0, rs, depth));
 
     for (int c = 0; c < cols; c += block_params.l2_cols) {
       int cs = std::min(block_params.l2_cols, cols - c);
 
       if (!pack_rhs_once) {
-        PackRhs(&packed_rhs, rhs.block(0, c, depth, cs));
+        PackRhs<BitDepth>(&packed_rhs, rhs.block(0, c, depth, cs));
       }
 
       Compute(kernel, block_params, &packed_result, packed_lhs, packed_rhs);
 
       auto result_block = result->block(r, c, rs, cs);
-      UnpackResult(&result_block, packed_result, depth,
-                   packed_lhs.rank_one_update(), packed_rhs.rank_one_update(),
-                   lhs_offset, rhs_offset, result_offset, result_mult_int,
-                   result_shift);
+      UnpackResult<BitDepth>(
+        &result_block, packed_result, depth,
+        packed_lhs.rank_one_update(), packed_rhs.rank_one_update(),
+        lhs_offset, rhs_offset, result_offset, result_mult_int,
+        result_shift);
     }
   }
 
