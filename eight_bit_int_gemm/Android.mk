@@ -34,9 +34,7 @@ LOCAL_SDK_VERSION := 8
 
 LOCAL_CPP_EXTENSION := .cc
 LOCAL_SRC_FILES:= eight_bit_int_gemm.cc
-
 LOCAL_CFLAGS += -no-integrated-as -std=c++11
-LOCAL_CFLAGS += -DGEMMLOWP_USE_OLD_ANDROID_SDK
 LOCAL_C_INCLUDES += external/gemmlowp/
 LOCAL_NDK_STL_VARIANT := stlport_static
 
