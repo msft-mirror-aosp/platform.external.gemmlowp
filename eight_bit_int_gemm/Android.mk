@@ -20,8 +20,6 @@ LOCAL_MODULE := libbnnmlowp
 
 LOCAL_CPP_EXTENSION := .cc
 LOCAL_SRC_FILES:= eight_bit_int_gemm.cc
-
-LOCAL_CFLAGS += -no-integrated-as -std=c++11
 LOCAL_C_INCLUDES += external/gemmlowp/
 
 include $(BUILD_STATIC_LIBRARY)
@@ -31,11 +29,15 @@ LOCAL_CLANG := true
 LOCAL_MODULE := libbnnmlowpV8
 
 LOCAL_SDK_VERSION := 8
-
 LOCAL_CPP_EXTENSION := .cc
 LOCAL_SRC_FILES:= eight_bit_int_gemm.cc
 
-LOCAL_CFLAGS += -no-integrated-as -std=c++11
+# Always build gemmlowpV8 for armv7 using NEON,
+# alternate non-SIMD route is built in libRSSupport.
+ifeq ($(ARCH_ARM_HAVE_ARMV7A),true)
+LOCAL_CFLAGS_arm := -mfpu=neon
+endif
+LOCAL_CFLAGS += -std=c++11
 LOCAL_CFLAGS += -DGEMMLOWP_USE_STLPORT
 LOCAL_C_INCLUDES += external/gemmlowp/
 LOCAL_NDK_STL_VARIANT := stlport_static
