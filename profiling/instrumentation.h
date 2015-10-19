@@ -43,20 +43,20 @@ using ::uintptr_t;
 }
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
-#include <algorithm>
 
 #ifdef GEMMLOWP_PROFILING
-#include <set>
-#include <cstdio>
 #include <cstring>
+#include <set>
 #endif
 
 // We should always use C++11 thread_local; unfortunately that
 // isn't fully supported on Apple yet.
 #ifdef __APPLE__
 #define GEMMLOWP_THREAD_LOCAL static __thread
+#define GEMMLOWP_USING_OLD_THREAD_LOCAL
 #else
 #define GEMMLOWP_THREAD_LOCAL thread_local
 #endif
@@ -185,8 +185,18 @@ struct ThreadInfo {
 };
 
 inline ThreadInfo& ThreadLocalThreadInfo() {
+#ifdef GEMMLOWP_USING_OLD_THREAD_LOCAL
+  // We're leaking this ThreadInfo structure, because Apple doesn't support
+  // non-trivial constructors or destructors for their __thread type modifier.
+  GEMMLOWP_THREAD_LOCAL ThreadInfo* i = nullptr;
+  if (i == nullptr) {
+    i = new ThreadInfo();
+  }
+  return *i;
+#else
   GEMMLOWP_THREAD_LOCAL ThreadInfo i;
   return i;
+#endif
 }
 
 // ScopedProfilingLabel is how one instruments code for profiling

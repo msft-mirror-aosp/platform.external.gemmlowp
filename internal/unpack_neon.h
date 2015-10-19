@@ -17,6 +17,7 @@
 #ifndef GEMMLOWP_INTERNAL_UNPACK_NEON_H_
 #define GEMMLOWP_INTERNAL_UNPACK_NEON_H_
 
+#include "output_neon.h"
 #include "unpack.h"
 
 #include <arm_neon.h>
@@ -24,7 +25,7 @@
 namespace gemmlowp {
 
 template <std::uint32_t numerator, std::uint32_t denominator>
-int32x4_t MultiplyByConstantFraction(int32x4_t x) {
+int32x4_t RoundingMultiplyByConstantFraction(int32x4_t x) {
   static_assert(numerator > 0 && denominator > 0,
                 "only supporting positive num/denom");
 
@@ -38,45 +39,71 @@ int32x4_t MultiplyByConstantFraction(int32x4_t x) {
       numerator - int_quotient * denominator;
   static const std::int32_t scaled_remaining_numerator =
       static_cast<std::int32_t>(
-          (static_cast<std::int64_t>(remaining_numerator) << 31) / denominator);
+          (static_cast<std::int64_t>(remaining_numerator) * (1ll << 31)) /
+          denominator);
+  // Note: vqrdmulh instruction is rounding doubling multiply high.
   const int32x4_t remaining_product =
       vqrdmulhq_n_s32(x, scaled_remaining_numerator);
 
   return vmlaq_n_s32(remaining_product, x, int_quotient);
 }
 
-template <BitDepthSetting BitDepth, typename PackedResultType>
-struct UnpackResultImpl<BitDepth, MatrixMap<std::uint8_t, MapOrder::ColMajor>,
-                        PackedResultType> {
-  typedef MatrixMap<std::uint8_t, MapOrder::ColMajor> ResultBlockType;
+template <typename tScalar, VectorShape tShape>
+int32x4_t get_int32x4_t_and_inc(
+    ConstIterator<VectorMap<tScalar, tShape>>* iterator) {
+  const int32x4_t result = vld1q_s32(iterator->get());
+  *iterator += 4;
+  return result;
+}
+
+template <typename tScalar, VectorShape tShape>
+int32x4_t get_int32x4_t_and_inc(
+    ConstIterator<VectorDup<tScalar, tShape>>* iterator) {
+  const int32x4_t result = vdupq_n_s32(**iterator);
+  // Increment really does nothing for VectorDup.
+  *iterator += 4;
+  return result;
+}
+
+template <typename BitDepthParams, typename PackedResultType,
+          typename OutputScalar, typename LhsOffset, typename RhsOffset,
+          typename OutputPipelineType>
+struct UnpackResultImpl<BitDepthParams,
+                        MatrixMap<OutputScalar, MapOrder::ColMajor>,
+                        PackedResultType, LhsOffset, RhsOffset,
+                        OutputPipelineType> {
+  typedef MatrixMap<OutputScalar, MapOrder::ColMajor> ResultBlockType;
   static void Unpack(ResultBlockType* dst, const PackedResultType& src,
-                     int depth, const std::int32_t* lhs_rank_one_update,
-                     const std::int32_t* rhs_rank_one_update,
-                     std::int32_t lhs_offset, std::int32_t rhs_offset,
-                     std::int32_t result_offset, std::int32_t result_mult_int,
-                     std::int32_t result_shift) {
+                     int depth, const std::int32_t* lhs_sums_of_each_slice,
+                     const std::int32_t* rhs_sums_of_each_slice,
+                     const LhsOffset& lhs_offset, const RhsOffset& rhs_offset,
+                     const OutputPipelineType& output_pipeline) {
     ScopedProfilingLabel label("optimized path (NEON)");
-    const int kLhsBits = LhsBitDepth<BitDepth>::kBits;
-    const int kRhsBits = RhsBitDepth<BitDepth>::kBits;
+    const int kLhsBits = BitDepthParams::LhsBitDepth::kBits;
+    const int kRhsBits = BitDepthParams::RhsBitDepth::kBits;
     const std::int32_t kLhsMax = (1 << kLhsBits) - 1;
     const std::int32_t kRhsMax = (1 << kRhsBits) - 1;
     auto src_map = src.Map();
-    const std::int32_t term_11 =
-        lhs_offset * rhs_offset * depth + result_offset;
-    const int32x4_t shift_reg = vdupq_n_s32(-result_shift);
-    const std::int32_t preshift_offset = 1 << (result_shift - 1);
-    const int32x4_t preshift_offset_reg = vdupq_n_s32(preshift_offset);
-    for (int c = 0; c < dst->cols(); c++) {
-      std::uint8_t* dst_ptr = dst->data(0, c);
-      const std::int32_t* src_ptr = src_map.data(0, c);
-      const std::int32_t* rank_one_update_ptr = lhs_rank_one_update;
-      const std::int32_t raw_1x = rhs_rank_one_update[c];
-      const std::int32_t term_1x =
-          MultiplyByConstantFraction<255, kRhsMax>(raw_1x);
-      const std::int32_t term_1x_plus_term_11 = term_1x + term_11;
+    OutputPipelineExecutor<OutputPipelineType, FragmentInt32x1x1>
+        output_pipeline_executor_int32x1x1(output_pipeline);
+    OutputPipelineExecutor<OutputPipelineType, NEONFragmentInt32x4x1>
+        output_pipeline_executor_int32x4x1(output_pipeline);
+    OutputPipelineExecutor<OutputPipelineType, NEONFragmentInt32x16x1>
+        output_pipeline_executor_int32x16x1(output_pipeline);
 
+    for (int c = 0; c < dst->cols(); c++) {
+      const std::int32_t* src_ptr = src_map.data(0, c);
+      const std::int32_t* sums_of_each_slice_ptr = lhs_sums_of_each_slice;
+      auto lhs_offset_iter = const_iterator(lhs_offset);
+      const std::int32_t rhs_offset_c = rhs_offset(c);
+      const std::int32_t rhs_sums_of_each_slice_c = rhs_sums_of_each_slice[c];
+
+      // Handle 16 values at once for higher performance
       int dst_rows_aligned16 = RoundDown<16>(dst->rows());
       for (int r = 0; r < dst_rows_aligned16; r += 16) {
+        // Compute the sum of the 4 terms,
+        //   q = term_xx + term_x1 + term_1x_plus_term_11
+        // Refer to the generic code in unpack.h.
         int32x4_t raw_xx[4];
         for (int i = 0; i < 4; i++) {
           raw_xx[i] = vld1q_s32(src_ptr);
@@ -84,79 +111,87 @@ struct UnpackResultImpl<BitDepth, MatrixMap<std::uint8_t, MapOrder::ColMajor>,
         }
         int32x4_t raw_x1[4];
         for (int i = 0; i < 4; i++) {
-          raw_x1[i] = vld1q_s32(rank_one_update_ptr);
-          rank_one_update_ptr += 4;
+          const int32x4_t sum_x1 = vld1q_s32(sums_of_each_slice_ptr);
+          raw_x1[i] = vmulq_n_s32(sum_x1, rhs_offset_c);
+          sums_of_each_slice_ptr += 4;
+        }
+        int32x4_t raw_1x[4];
+        int32x4_t term_11[4];
+        for (int i = 0; i < 4; i++) {
+          const int32x4_t lhs_offsets = get_int32x4_t_and_inc(&lhs_offset_iter);
+          raw_1x[i] = vmulq_n_s32(lhs_offsets, rhs_sums_of_each_slice_c);
+          term_11[i] = vmulq_n_s32(lhs_offsets, rhs_offset_c * depth);
         }
         int32x4_t term_xx[4];
         for (int i = 0; i < 4; i++) {
           term_xx[i] =
-              MultiplyByConstantFraction<255 * 255, kLhsMax * kRhsMax>(
+              RoundingMultiplyByConstantFraction<255 * 255, kLhsMax * kRhsMax>(
                   raw_xx[i]);
         }
         int32x4_t term_x1[4];
         for (int i = 0; i < 4; i++) {
-          term_x1[i] = MultiplyByConstantFraction<255, kLhsMax>(raw_x1[i]);
+          term_x1[i] =
+              RoundingMultiplyByConstantFraction<255, kLhsMax>(raw_x1[i]);
         }
-        int32x4_t q[4];
+        int32x4_t term_1x[4];
         for (int i = 0; i < 4; i++) {
-          q[i] = vaddq_s32(vaddq_s32(term_xx[i], term_x1[i]),
-                           vdupq_n_s32(term_1x_plus_term_11));
+          term_1x[i] =
+              RoundingMultiplyByConstantFraction<255, kRhsMax>(raw_1x[i]);
         }
+        int32x4x4_t q;
         for (int i = 0; i < 4; i++) {
-          q[i] = vmulq_n_s32(q[i], result_mult_int);
+          q.val[i] = vaddq_s32(vaddq_s32(term_xx[i], term_x1[i]),
+                               vaddq_s32(term_1x[i], term_11[i]));
         }
-        for (int i = 0; i < 4; i++) {
-          q[i] = vshlq_s32(vaddq_s32(q[i], preshift_offset_reg), shift_reg);
-        }
-        int16x4_t q16[4];
-        for (int i = 0; i < 4; i++) {
-          q16[i] = vqmovn_s32(q[i]);
-        }
-        uint8x8_t q8[4];
-        for (int i = 0; i < 4; i++) {
-          q8[i] = vqmovun_s16(vcombine_s16(q16[i], q16[i]));
-        }
-        for (int i = 0; i < 4; i++) {
-          vst1_lane_u32(reinterpret_cast<std::uint32_t*>(dst_ptr),
-                        vreinterpret_u32_u8(q8[i]), 0);
-          dst_ptr += 4;
-        }
+        NEONFragmentInt32x16x1 f(q);
+        output_pipeline_executor_int32x16x1.Execute(f, dst, r, c);
       }
       // We have finished handling groups of 16 entries at once; now
       // try to handle 4 entries at once.
       int dst_rows_aligned4 = RoundDown<4>(dst->rows());
       for (int r = dst_rows_aligned16; r < dst_rows_aligned4; r += 4) {
+        // Compute the sum of the 4 terms,
+        //   q = term_xx + term_x1 + term_1x_plus_term_11
+        // Refer to the generic code in unpack.h.
         const int32x4_t raw_xx = vld1q_s32(src_ptr);
-        const int32x4_t term_xx =
-            MultiplyByConstantFraction<255 * 255, kLhsMax * kRhsMax>(raw_xx);
-        const int32x4_t raw_x1 = vld1q_s32(rank_one_update_ptr);
-        const int32x4_t term_x1 =
-            MultiplyByConstantFraction<255, kLhsMax>(raw_x1);
-        int32x4_t q = vaddq_s32(vaddq_s32(term_xx, term_x1),
-                                vdupq_n_s32(term_1x_plus_term_11));
-        q = vmulq_n_s32(q, result_mult_int);
-        q = vshlq_s32(vaddq_s32(q, preshift_offset_reg), shift_reg);
-        int16x4_t q16 = vqmovn_s32(q);
-        uint8x8_t q8 = vqmovun_s16(vcombine_s16(q16, q16));
-        vst1_lane_u32(reinterpret_cast<std::uint32_t*>(dst_ptr),
-                      vreinterpret_u32_u8(q8), 0);
-        dst_ptr += 4;
         src_ptr += 4;
-        rank_one_update_ptr += 4;
+        const int32x4_t term_xx =
+            RoundingMultiplyByConstantFraction<255 * 255, kLhsMax * kRhsMax>(
+                raw_xx);
+        const int32x4_t sum_x1 = vld1q_s32(sums_of_each_slice_ptr);
+        const int32x4_t raw_x1 = vmulq_n_s32(sum_x1, rhs_offset_c);
+        sums_of_each_slice_ptr += 4;
+        const int32x4_t term_x1 =
+            RoundingMultiplyByConstantFraction<255, kLhsMax>(raw_x1);
+        const int32x4_t lhs_offsets = get_int32x4_t_and_inc(&lhs_offset_iter);
+        const int32x4_t raw_1x =
+            vmulq_n_s32(lhs_offsets, rhs_sums_of_each_slice_c);
+        const int32x4_t term_1x =
+            RoundingMultiplyByConstantFraction<255, kRhsMax>(raw_1x);
+        const int32x4_t term_11 =
+            vmulq_n_s32(lhs_offsets, rhs_offset_c * depth);
+        int32x4_t q = vaddq_s32(vaddq_s32(term_xx, term_x1),
+                                vaddq_s32(term_1x, term_11));
+        NEONFragmentInt32x4x1 f(q);
+        output_pipeline_executor_int32x4x1.Execute(f, dst, r, c);
       }
       // We have finished handling 4 entries at once; now handle
-      // remaining entries one by one.
+      // remaining entries one by one. This scalar code is similar
+      // to the code in unpack.h, see comments there.
       for (int r = dst_rows_aligned4; r < dst->rows(); r++) {
-        std::int32_t raw_xx = src_map(r, c);
-        std::int32_t raw_x1 = lhs_rank_one_update[r];
-        std::int32_t term_xx =
-            MultiplyByConstantFraction<255 * 255, kLhsMax * kRhsMax>(raw_xx);
-        std::int32_t term_x1 =
-            MultiplyByConstantFraction<255, kLhsMax>(raw_x1);
-        std::int32_t sum = term_xx + term_x1 + term_1x_plus_term_11;
-        std::int32_t result =
-            (sum * result_mult_int + (1 << (result_shift - 1))) >> result_shift;
-        (*dst)(r, c) = result > 255 ? 255 : result < 0 ? 0 : result;
+        const std::int32_t raw_xx = src_map(r, c);
+        const std::int32_t raw_x1 = lhs_sums_of_each_slice[r] * rhs_offset_c;
+        const std::int32_t raw_1x = rhs_sums_of_each_slice_c * lhs_offset(r);
+        const std::int32_t term_xx =
+            RoundingMultiplyByConstantFraction<255 * 255, kLhsMax * kRhsMax>(
+                raw_xx);
+        const std::int32_t term_x1 =
+            RoundingMultiplyByConstantFraction<255, kLhsMax>(raw_x1);
+        const std::int32_t term_1x =
+            RoundingMultiplyByConstantFraction<255, kRhsMax>(raw_1x);
+        const std::int32_t term_11 = lhs_offset(r) * rhs_offset(c) * depth;
+        FragmentInt32x1x1 sum = term_xx + term_x1 + term_1x + term_11;
+        output_pipeline_executor_int32x1x1.Execute(sum, dst, r, c);
       }
     }
   }

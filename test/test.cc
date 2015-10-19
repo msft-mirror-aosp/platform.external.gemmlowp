@@ -15,17 +15,19 @@
 #include "test.h"
 
 #include <unistd.h>
-#include <iostream>
-#include <ctime>
 #include <cstdint>
-#include <vector>
 #include <cstdlib>
+#include <ctime>
+#include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
-#include "../public/gemmlowp.h"
-#include "../internal/kernel_reference.h"
 #include "../eight_bit_int_gemm/eight_bit_int_gemm.h"
+#include "../internal/kernel_reference.h"
 #include "test_data.h"
 
 namespace gemmlowp {
@@ -41,23 +43,24 @@ void ReferenceEightBitIntGemm(bool transpose_a, bool transpose_b,
   assert(a != nullptr);
   assert(b != nullptr);
   assert(c != nullptr);
+
   int a_i_stride;
   int a_l_stride;
-  if (transpose_a == transpose_c) {
-    a_i_stride = 1;
-    a_l_stride = lda;
-  } else {
+  if (transpose_a) {
     a_i_stride = lda;
     a_l_stride = 1;
+  } else {
+    a_i_stride = 1;
+    a_l_stride = lda;
   }
   int b_j_stride;
   int b_l_stride;
-  if (transpose_b == transpose_c) {
-    b_j_stride = ldb;
-    b_l_stride = 1;
-  } else {
+  if (transpose_b) {
     b_j_stride = 1;
     b_l_stride = ldb;
+  } else {
+    b_j_stride = ldb;
+    b_l_stride = 1;
   }
   int c_i_stride;
   int c_j_stride;
@@ -69,6 +72,8 @@ void ReferenceEightBitIntGemm(bool transpose_a, bool transpose_b,
     c_j_stride = ldc;
   }
   int i, j, l;
+
+  const std::int32_t kRoundingTerm = (c_shift < 1) ? 0 : (1 << (c_shift - 1));
 
   for (j = 0; j < n; j++) {
     for (i = 0; i < m; i++) {
@@ -84,7 +89,7 @@ void ReferenceEightBitIntGemm(bool transpose_a, bool transpose_b,
         total += mult_as_int;
       }
       int32_t output =
-          (((total + c_offset) * c_mult_int) + (1 << (c_shift - 1))) >> c_shift;
+          (((total + c_offset) * c_mult_int) + kRoundingTerm) >> c_shift;
       if (output > 255) {
         output = 255;
       }
@@ -96,12 +101,13 @@ void ReferenceEightBitIntGemm(bool transpose_a, bool transpose_b,
     }
   }
 }
+
 // *GemmWrapper's allow to wrap various Gemm functions in a uniform
 // interface, so we can use the same testing code to test all of them
 
-template <typename Kernel, typename Scalar, BitDepthSetting BitDepth>
+template <typename Kernel, typename Scalar, typename tBitDepthParams>
 struct SingleThreadGemmWrapper {
-  static const BitDepthSetting kBitDepthSetting = BitDepth;
+  typedef tBitDepthParams BitDepthParams;
 
   static const char* Name() {
     static char buf[256];
@@ -118,16 +124,21 @@ struct SingleThreadGemmWrapper {
                    MatrixMap<Scalar, ResultOrder>* result, int lhs_offset,
                    int rhs_offset, int result_offset, int result_mult_int,
                    int result_shift) {
-    SingleThreadGemm<typename Kernel::Format, Scalar, BitDepth, LhsOrder,
-                     RhsOrder, ResultOrder>(
-        context, Kernel(), lhs, rhs, result, lhs_offset, rhs_offset,
-        result_offset, result_mult_int, result_shift);
+    const OffsetColDup lhs_offset_vector(lhs_offset, lhs.rows());
+    const OffsetRowDup rhs_offset_vector(rhs_offset, rhs.cols());
+    SingleThreadGemm<typename Kernel::Format, Scalar, Scalar, BitDepthParams,
+                     LhsOrder, RhsOrder, ResultOrder,
+                     OffsetColDup, OffsetRowDup>(
+        context, Kernel(), lhs, rhs, result, lhs_offset_vector,
+        rhs_offset_vector,
+        MakeStandardOutputPipeline(result_offset, result_mult_int,
+                                   result_shift));
   }
 };
 
-template <typename Kernel, typename Scalar, BitDepthSetting BitDepth>
+template <typename Kernel, typename Scalar, typename tBitDepthParams>
 struct MultiThreadGemmWrapper {
-  static const BitDepthSetting kBitDepthSetting = BitDepth;
+  typedef tBitDepthParams BitDepthParams;
 
   static const char* Name() {
     static char buf[256];
@@ -144,16 +155,21 @@ struct MultiThreadGemmWrapper {
                    MatrixMap<Scalar, ResultOrder>* result, int lhs_offset,
                    int rhs_offset, int result_offset, int result_mult_int,
                    int result_shift) {
-    MultiThreadGemm<typename Kernel::Format, Scalar, BitDepth, LhsOrder,
-                    RhsOrder, ResultOrder>(
-        context, Kernel(), lhs, rhs, result, lhs_offset, rhs_offset,
-        result_offset, result_mult_int, result_shift);
+    const OffsetColDup lhs_offset_vector(lhs_offset, lhs.rows());
+    const OffsetRowDup rhs_offset_vector(rhs_offset, rhs.cols());
+    MultiThreadGemm<typename Kernel::Format, Scalar, Scalar, BitDepthParams,
+                    LhsOrder, RhsOrder, ResultOrder,
+                    OffsetColDup, OffsetRowDup>(
+        context, Kernel(), lhs, rhs, result, lhs_offset_vector,
+        rhs_offset_vector,
+        MakeStandardOutputPipeline(result_offset, result_mult_int,
+                                   result_shift));
   }
 };
 
-template <typename Scalar, BitDepthSetting BitDepth>
+template <typename Scalar, typename tBitDepthParams>
 struct PublicGemmWrapper {
-  static const BitDepthSetting kBitDepthSetting = BitDepth;
+  typedef tBitDepthParams BitDepthParams;
 
   static const char* Name() { return "public Gemm"; }
 
@@ -166,19 +182,26 @@ struct PublicGemmWrapper {
                    MatrixMap<Scalar, ResultOrder>* result, int lhs_offset,
                    int rhs_offset, int result_offset, int result_mult_int,
                    int result_shift) {
-    gemmlowp::Gemm<uint8_t, BitDepth, LhsOrder, RhsOrder, ResultOrder>(
+    gemmlowp::Gemm<uint8_t, BitDepthParams, LhsOrder, RhsOrder, ResultOrder>(
         context, lhs, rhs, result, lhs_offset, rhs_offset, result_offset,
         result_mult_int, result_shift);
   }
 };
 
+template <eight_bit_int_gemm::BitDepthSetting BitDepth>
+struct BitDepthParamsForSettings {};
+
+template <>
+struct BitDepthParamsForSettings<eight_bit_int_gemm::BitDepthSetting::A8B8>
+    : DefaultL8R8BitDepthParams {};
+
+template <>
+struct BitDepthParamsForSettings<eight_bit_int_gemm::BitDepthSetting::A5B7>
+    : DefaultL7R5BitDepthParams {};
+
 template <typename Scalar, eight_bit_int_gemm::BitDepthSetting BitDepth>
 struct EightBitIntGemmWrapper {
-  static const eight_bit_int_gemm::BitDepthSetting kEBitDepthSetting = BitDepth;
-  static const BitDepthSetting kBitDepthSetting =
-      BitDepth == eight_bit_int_gemm::BitDepthSetting::A5B7
-          ? BitDepthSetting::L7R5
-          : BitDepthSetting::L8R8;
+  typedef BitDepthParamsForSettings<BitDepth> BitDepthParams;
 
   static const char* Name() { return "EightBitIntGemm"; }
 
@@ -190,23 +213,20 @@ struct EightBitIntGemmWrapper {
                    MatrixMap<Scalar, ResultOrder>* result, int lhs_offset,
                    int rhs_offset, int result_offset, int result_mult_int,
                    int result_shift) {
-    const bool transpose_c = ResultOrder == MapOrder::ColMajor;
-    const bool transpose_a =
-        RhsOrder == MapOrder::RowMajor ? transpose_c : !transpose_c;
-    const bool transpose_b =
-        LhsOrder == MapOrder::RowMajor ? transpose_c : !transpose_c;
-
+    const bool transpose_c = ResultOrder == MapOrder::RowMajor;
+    const bool transpose_a = LhsOrder == MapOrder::RowMajor;
+    const bool transpose_b = RhsOrder == MapOrder::RowMajor;
     eight_bit_int_gemm::EightBitIntGemm(
-        transpose_a, transpose_b, transpose_c, rhs.cols(), lhs.rows(),
-        lhs.cols(), rhs.data(), rhs_offset, rhs.stride(), lhs.data(),
-        lhs_offset, lhs.stride(), result->data(), result_offset,
-        result_mult_int, result_shift, result->stride(), kEBitDepthSetting);
+        transpose_a, transpose_b, transpose_c, lhs.rows(), rhs.cols(),
+        lhs.cols(), lhs.data(), lhs_offset, lhs.stride(), rhs.data(),
+        rhs_offset, rhs.stride(), result->data(), result_offset,
+        result_mult_int, result_shift, result->stride(), BitDepth);
   }
 };
 
 template <typename Scalar>
 struct ReferenceEightBitIntGemmWrapper {
-  static const BitDepthSetting kBitDepthSetting = BitDepthSetting::L8R8;
+  typedef DefaultL8R8BitDepthParams BitDepthParams;
 
   static const char* Name() { return "ReferenceEightBitIntGemm"; }
 
@@ -217,9 +237,9 @@ struct ReferenceEightBitIntGemmWrapper {
                    MatrixMap<Scalar, ResultOrder>* result, int lhs_offset,
                    int rhs_offset, int result_offset, int result_mult_int,
                    int result_shift) {
-    ReferenceEightBitIntGemm(transpose_a, transpose_b, transpose_c, rhs.cols(),
-                             lhs.rows(), lhs.cols(), rhs.data(), rhs_offset,
-                             rhs.stride(), lhs.data(), lhs_offset, lhs.stride(),
+    ReferenceEightBitIntGemm(transpose_a, transpose_b, transpose_c, lhs.rows(),
+                             rhs.cols(), lhs.cols(), lhs.data(), lhs_offset,
+                             lhs.stride(), rhs.data(), rhs_offset, rhs.stride(),
                              result->data(), result_offset, result_mult_int,
                              result_shift, result->stride());
   }
@@ -236,8 +256,7 @@ struct ResultStats {
         mean_signed_diff(0),
         med_signed_diff(0),
         med_unsigned_diff(0),
-        max_unsigned_diff(0)
-  {}
+        max_unsigned_diff(0) {}
 
   int count;
   int med_val;
@@ -324,12 +343,11 @@ void ReportResultStats(const ResultStats& stats,
          stats.mean_signed_diff, bounds.mean_signed_diff);
 
   printf("No error: %.2f %% of entries\n",
-    100.f * stats.count_diff_by_pot_slice[0] / stats.count);
+         100.f * stats.count_diff_by_pot_slice[0] / stats.count);
   for (int exponent = 1; exponent < 9; exponent++) {
-    printf("Error in %d..%d range: %.2f %% of entries\n",
-      1 << (exponent - 1),
-      (1 << exponent) - 1,
-      100.f * stats.count_diff_by_pot_slice[exponent] / stats.count);
+    printf("Error in %d..%d range: %.2f %% of entries\n", 1 << (exponent - 1),
+           (1 << exponent) - 1,
+           100.f * stats.count_diff_by_pot_slice[exponent] / stats.count);
   }
 }
 
@@ -364,17 +382,15 @@ void test_gemm_impl(typename GemmWrapper::Context* context, const LhsType& lhs,
   static const MapOrder kRhsOrder = RhsType::kOrder;
   static const MapOrder kResultOrder = ResultType::kOrder;
   ResultType ref_result(rows, cols);
-  const bool transpose_c = kResultOrder == MapOrder::ColMajor;
-  const bool transpose_a =
-      kRhsOrder == MapOrder::RowMajor ? transpose_c : !transpose_c;
-  const bool transpose_b =
-      kLhsOrder == MapOrder::RowMajor ? transpose_c : !transpose_c;
+  const bool transpose_c = kResultOrder == MapOrder::RowMajor;
+  const bool transpose_a = kLhsOrder == MapOrder::RowMajor;
+  const bool transpose_b = kRhsOrder == MapOrder::RowMajor;
   ReferenceEightBitIntGemmWrapper<Scalar>::Gemm(
       transpose_a, transpose_b, transpose_c, lhs.const_map(), rhs.const_map(),
       &ref_result.map(), lhs_offset, rhs_offset, result_offset, result_mult_int,
       result_shift);
 
-  static const BitDepthSetting BitDepth = GemmWrapper::kBitDepthSetting;
+  typedef typename GemmWrapper::BitDepthParams BitDepthParams;
 
   ResultStats stats;
   GetResultStats(result->data(), ref_result.data(), rows * cols, &stats);
@@ -405,7 +421,8 @@ void test_gemm_impl(typename GemmWrapper::Context* context, const LhsType& lhs,
 
   ResultStatsBounds bounds;
 
-  if (BitDepth == BitDepthSetting::L7R5) {
+  if (BitDepthParams::LhsBitDepth::kBits < 8 ||
+      BitDepthParams::RhsBitDepth::kBits < 8) {
     // We have very lax requirements on unsigned diff.
     // We have tighter requirements on signed diff (bias), but only
     // if the matrix is large enough for things to average out.
@@ -523,7 +540,8 @@ void test_gemm(typename GemmWrapper::Context* context, int rows, int depth,
 
 template <typename Kernel>
 void test_gemm_kernel(MultiThreadGemmContext* context) {
-  typedef MultiThreadGemmWrapper<Kernel, std::uint8_t, BitDepthSetting::L8R8>
+  typedef MultiThreadGemmWrapper<Kernel, std::uint8_t,
+                                 DefaultL8R8BitDepthParams>
       GemmWrapper;
   test_gemm<GemmWrapper>(context, 1, 1, 1, WhatParamsToTest::OnlyGenericCase,
                          WhatOrdersToTest::OnlyRCC);
@@ -686,6 +704,363 @@ const char* GetBitDepthName(eight_bit_int_gemm::BitDepthSetting b) {
   }
 }
 
+// Runs a small set of hand-picked data for per-channel quantized data.
+// This test case comes from a set of 2 2x2 convolution filters run over a 3x3
+// image.
+void TestWithSmallDataPerChannelQuantization() {
+  const int m = 2;
+  const int n = 9;
+  const int k = 12;
+
+  // 12 x 2, columnwise.
+  const uint8_t a_data[] = {
+     0,  0,  0,  0,  0,  0, 0, 0, 0, 255, 255, 255,
+    64, 64, 64, 64, 64, 64, 0, 0, 0, 255, 255, 255
+  };
+  const int lda = k;
+  int a_offset[] = {0, -64};
+  MatrixMap<const std::uint8_t, MapOrder::RowMajor> lhs(a_data, m, k, lda);
+  const OffsetColMap lhs_offset(a_offset, m);
+
+  // 12 x 9, columnwise.
+  const uint8_t b_data[] = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0, 255, 255, 255,
+      0,   0,   0,   0,   0,   0, 255, 255, 255,   0,   0,   0,
+      0,   0,   0, 127, 127, 127,   0,   0,   0, 127, 127, 127,
+      0,   0,   0, 255, 255, 255,   0,   0,   0,   0,   0,   0,
+    255, 255, 255,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0, 127, 127, 127,   0,   0,   0, 127, 127, 127,
+      0,   0,   0,   0,   0,   0, 127, 127, 127, 127, 127, 127,
+      0,   0,   0,   0,   0,   0, 127, 127, 127, 127, 127, 127,
+      0,   0,   0, 127, 127, 127, 127, 127, 127, 127, 127, 127
+  };
+  const int ldb = k;
+  int b_offset = -127;
+  MatrixMap<const std::uint8_t, MapOrder::ColMajor> rhs(b_data, k, n, ldb);
+  const OffsetRowDup rhs_offset(b_offset, rhs.cols());
+
+  // 2 x 9, columnwise.
+  const uint8_t expected_c_data[] = {
+    255, 255,
+      0,   0,
+    127, 159,
+      0,  64,
+      0,  64,
+    127, 159,
+    127, 127,
+    127, 127,
+    127, 127
+  };
+  const int ldc = m;
+  int c_offset[] = {97155, 97346};
+  int c_mult_int[] = {2741, 2741};
+  const int c_shift = 21;
+
+  const int c_count = m * n;
+  std::unique_ptr<uint8_t[]> output_data(new uint8_t[c_count]);
+  MatrixMap<std::uint8_t, MapOrder::ColMajor> result(output_data.get(), m, n,
+                                                     ldc);
+  const OffsetColMap result_offset(c_offset, m);
+  const OffsetColMap result_mult_int(c_mult_int, m);
+  const int result_shift = c_shift;
+
+  GemmContext gemm_context;
+  auto output_pipeline = MakeStandardOutputPipeline<VectorShape::Col>(
+      result_offset, result_mult_int, result_shift);
+  GemmWithOutputPipelinePC<uint8_t, uint8_t, DefaultL8R8BitDepthParams>(
+      &gemm_context, lhs, rhs, &result, lhs_offset, rhs_offset,
+      output_pipeline);
+
+  ResultStats stats;
+  GetResultStats(output_data.get(), expected_c_data, c_count, &stats);
+
+  ResultStatsBounds bounds;
+  const bool good = CheckResultStatsBounds(stats, bounds);
+  printf("TestWithSmallDataPerChannelQuantization: %s\n",
+         good ? "PASS" : "FAIL");
+  ReportResultStats(stats, bounds);
+  Check(good);
+}
+
+// Runs a larger set of hand-picked data for per-channel quantized data.
+// This test case comes from a set of 22 3x3 convolution filters run over a 5x5
+// image.  Right now, I have 7 different filters and 15 copies of the first
+// filter to make sure NEON code path that processes 16 rows at a time is
+// covered.
+void TestWithLargeDataPerChannelQuantization() {
+  const int m = 22;
+  const int n = 25;
+  const int k = 27;
+
+  // 27 x 22, column-wise.
+  const uint8_t a_data[] = {
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0, 127, 127, 127, 255, 255, 255,
+       127, 127, 127,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0, 127, 127, 127,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0, 127, 127, 127,  0,  0,  0,
+    51, 51, 51,  51,  51,  51, 51, 51, 51,   0,   0,   0, 255, 255, 255,
+         0,   0,   0, 51, 51, 51,  51,  51,  51, 51, 51, 51,
+    51, 51, 51,   0,   0,   0, 51, 51, 51,  51,  51,  51, 255, 255, 255,
+        51,  51,  51, 51, 51, 51,   0,   0,   0, 51, 51, 51,
+     0,  0,  0,  64,  64,  64,  0,  0,  0,  64,  64,  64, 255, 255, 255,
+        64,  64,  64,  0,  0,  0,  64,  64,  64,  0,  0,  0,
+    36, 36, 36,   0,   0,   0, 36, 36, 36,   0,   0,   0, 255, 255, 255,
+         0,   0,   0, 36, 36, 36,   0,   0,   0, 36, 36, 36,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+     0,  0,  0,   0,   0,   0,  0,  0,  0,   0,   0,   0, 255, 255, 255,
+         0,   0,   0,  0,  0,  0,   0,   0,   0,  0,  0,  0,
+  };
+  const int lda = k;
+  int a_offset[] = {
+      0, 0, 0, -51, -51, 0, -36, 0, 0, 0,
+      0, 0, 0,   0,   0, 0,   0, 0, 0, 0,
+      0, 0
+  };
+  MatrixMap<const std::uint8_t, MapOrder::RowMajor> lhs(a_data, m, k, lda);
+  const OffsetColMap lhs_offset(a_offset, m);
+
+  // 27 x 25, column-wise.
+  const uint8_t b_data[] = {
+    127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 119, 119, 119,
+         119, 119, 119, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+    127, 127, 127, 127, 127, 127, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    127, 127, 127, 127, 127, 127, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    127, 127, 127, 127, 127, 127, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    127, 127, 127, 127, 127, 127, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+         127, 127, 127, 119, 119, 119, 119, 119, 119, 127, 127, 127,
+    127, 127, 127, 119, 119, 119, 119, 119, 119, 127, 127, 127, 119, 119, 119,
+         119, 119, 119, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 136, 136, 136,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 136, 136, 136, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 136, 136, 136, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+         127, 127, 127, 119, 119, 119, 119, 119, 119, 127, 127, 127,
+    127, 127, 127, 119, 119, 119, 119, 119, 119, 127, 127, 127, 119, 119, 119,
+         119, 119, 119, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         136, 136, 136, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 136, 136, 136,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 136, 136, 136, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+         127, 127, 127, 119, 119, 119, 119, 119, 119, 127, 127, 127,
+    127, 127, 127, 119, 119, 119, 119, 119, 119, 127, 127, 127, 119, 119, 119,
+         119, 119, 119, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 136, 136, 136, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 136, 136, 136, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    136, 136, 136, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+    119, 119, 119, 119, 119, 119, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+         127, 127, 127, 119, 119, 119, 119, 119, 119, 127, 127, 127,
+    127, 127, 127, 119, 119, 119, 119, 119, 119, 127, 127, 127, 119, 119, 119,
+         119, 119, 119, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+    119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119, 119,
+         119, 119, 119, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+    119, 119, 119, 119, 119, 119, 127, 127, 127, 119, 119, 119, 119, 119, 119,
+         127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127, 127
+  };
+  const int ldb = k;
+  int b_offset = -127;
+  MatrixMap<const std::uint8_t, MapOrder::ColMajor> rhs(b_data, k, n, ldb);
+  const OffsetRowDup rhs_offset(b_offset, rhs.cols());
+
+  // 22 x 25, column-wise.
+  const uint8_t expected_c_data[] = {
+      7,  37,  37,  67,  67,  39,  79,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,  37,  87,  67,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,  37,  87,  67,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,  37,  87,  67,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,  37,  67,  67,  39,  79,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,   7,  67,  87,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,   7,  87,  87,   7, 103,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,  71,  87,  45,  41,  77,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,   7,  87,  87,   7, 103,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,   7,  67,  87,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,   7,  67,  87,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  71,   7,  45,  87,  41,  77,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+    255, 135, 135, 255, 255, 143, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+         255, 255, 255, 255, 255, 255, 255,
+      7,  71,   7,  45,  87,  41,  77,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,   7,  67,  87,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,   7,  67,  87,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,   7,  87,  87,   7, 103,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,  71,  87,  45,  41,  77,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,   7,  87,  87,   7, 103,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,   7,  67,  87,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,  37,  67,  67,  39,  79,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,  37,  87,  67,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,  37,  87,  67,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,   7,  37,  87,  67,  23,  91,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+      7,  37,  37,  67,  67,  39,  79,   7,   7,   7,   7,   7,   7,   7,   7,
+           7,   7,   7,   7,   7,   7,   7,
+     99,  99,  99,  99,  99,  99,  99,  99,  99,  99,  99,  99,  99,  99,  99,
+          99,  99,  99,  99,  99,  99,  99,
+    111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111, 111,
+         111, 111, 111, 111, 111, 111, 111,
+  };
+  const int ldc = m;
+  int c_offset[] = {
+      6477, 12954, 12954, 7793, 7793, 12954, 9282, 6477, 6477, 6477,
+      6477,  6477,  6477, 6477, 6477,  6477, 6477, 6477, 6477, 6477,
+      6477,  6477,
+  };
+  int c_mult_int[] = {
+      41121, 20560, 20560, 34267, 34267, 21937, 28784, 41121, 41121, 41121,
+      41121, 41121, 41121, 41121, 41121, 41121, 41121, 41121, 41121, 41121,
+      41121, 41121,
+  };
+  const int c_shift = 21;
+
+  const int c_count = m * n;
+  std::unique_ptr<uint8_t[]> output_data(new uint8_t[c_count]);
+  MatrixMap<std::uint8_t, MapOrder::ColMajor> result(output_data.get(), m, n,
+                                                     ldc);
+  const OffsetColMap result_offset(c_offset, m);
+  const OffsetColMap result_mult_int(c_mult_int, m);
+  const int result_shift = c_shift;
+
+  GemmContext gemm_context;
+  auto output_pipeline = MakeStandardOutputPipeline<VectorShape::Col>(
+      result_offset, result_mult_int, result_shift);
+  GemmWithOutputPipelinePC<uint8_t, uint8_t, DefaultL8R8BitDepthParams>(
+      &gemm_context, lhs, rhs, &result, lhs_offset, rhs_offset,
+      output_pipeline);
+
+  ResultStats stats;
+  GetResultStats(output_data.get(), expected_c_data, c_count, &stats);
+
+  ResultStatsBounds bounds;
+  const bool good = CheckResultStatsBounds(stats, bounds);
+  printf("TestWithLargeDataPerChannelQuantization: %s\n",
+         good ? "PASS" : "FAIL");
+  ReportResultStats(stats, bounds);
+  Check(good);
+}
+
+// Runs a small set of hand-calculated data through the implementation.
+void TestWithSmallData() {
+  const int m = 4;
+  const int n = 2;
+  const int k = 3;
+  // Matrix A (LHS) is:
+  // |  7 | 10 | 13 | 16 |
+  // |  8 | 11 | 14 | 17 |
+  // |  9 | 12 | 15 | 18 |
+  const uint8_t a_data[] = {7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18};
+  // Matrix B (RHS) is:
+  // |  1 |  3 |  5 |
+  // |  2 |  4 |  6 |
+  const uint8_t b_data[] = {1, 2, 3, 4, 5, 6};
+  // Here are the results we expect, from hand calculations:
+  // (1 * 7) + (3 * 8) + (5 * 9) = 76
+  // (2 * 7) + (4 * 8) + (6 * 9) = 100
+  // (1 * 10) + (3 * 11) + (5 * 12) = 103
+  // (2 * 10) + (4 * 11) + (6 * 12) = 136
+  // (1 * 13) + (3 * 14) + (5 * 15) = 130
+  // (2 * 13) + (4 * 14) + (6 * 15) = 172
+  // (1 * 16) + (3 * 17) + (5 * 18) = 157
+  // (2 * 16) + (4 * 17) + (6 * 18) = 208
+  // That means matrix C should be:
+  // |  76 | 103 | 130 | 157 |
+  // | 100 | 136 | 172 | 208 |
+  const uint8_t expected_data[] = {76, 100, 103, 136, 130, 172, 157, 208};
+
+  const int c_count = m * n;
+  std::unique_ptr<uint8_t[]> output_data(new uint8_t[c_count]);
+
+  const bool is_a_transposed = true;
+  const bool is_b_transposed = true;
+  const bool is_c_transposed = true;
+  const int lda = k;
+  const int ldb = n;
+  const int ldc = n;
+
+  const int a_offset = 0;
+  const int b_offset = 0;
+  const int c_offset = 0;
+  const int c_mult = 1;
+  const int c_shift = 0;
+
+  gemmlowp::eight_bit_int_gemm::EightBitIntGemm(
+      is_a_transposed, is_b_transposed, is_c_transposed, m, n, k, a_data,
+      a_offset, lda, b_data, b_offset, ldb, output_data.get(), c_offset, c_mult,
+      c_shift, ldc, eight_bit_int_gemm::BitDepthSetting::A8B8);
+
+  ResultStats stats;
+  GetResultStats(output_data.get(), expected_data, c_count, &stats);
+
+  ResultStatsBounds bounds;
+  const bool good = CheckResultStatsBounds(stats, bounds);
+  printf("TestWithSmallData: %s\n", good ? "PASS" : "FAIL");
+  ReportResultStats(stats, bounds);
+  Check(good);
+}
+
 // This is the most realistic test of how we'll be using the low-precision GEMM
 // function in applications. It takes in large input matrices that have been
 // captured from an actual neural network run.
@@ -697,7 +1072,7 @@ void TestWithRealData(eight_bit_int_gemm::BitDepthSetting BitDepth,
       test_data::is_c_transposed, test_data::m, test_data::n, test_data::k,
       test_data::a_data, test_data::a_offset, test_data::k, test_data::b_data,
       test_data::b_offset, test_data::k, output_data.get(), test_data::c_offset,
-      test_data::c_mult_int, test_data::c_shift, test_data::n, BitDepth);
+      test_data::c_mult_int, test_data::c_shift, test_data::m, BitDepth);
 
   ResultStats stats;
   GetResultStats(output_data.get(), test_data::expected_c_data,
@@ -718,41 +1093,260 @@ void TestWithRealData(eight_bit_int_gemm::BitDepthSetting BitDepth,
   Check(good);
 }
 
-void test() {
-#ifdef GEMMLOWP_TEST_PROFILE
-  RegisterCurrentThreadForProfiling();
-  StartProfiling();
-#endif
+template <MapOrder ResultOrder>
+void TestOutputStages(int rows, int depth, int cols, int result_offset,
+                      int result_mult_int, int result_shift) {
+  Matrix<std::uint8_t, MapOrder::RowMajor> lhs(rows, depth);
+  Matrix<std::uint8_t, MapOrder::ColMajor> rhs(depth, cols);
+  Matrix<std::int32_t, ResultOrder> result_raw_int32(rows, cols);
+  MakeRandom(&lhs, 8);
+  MakeRandom(&rhs, 8);
+  const int lhs_offset = 12;
+  const int rhs_offset = -34;
 
+  // Test an empty pipeline, i.e. returning raw int32 accumulators.
+  auto empty_pipeline = std::make_tuple();
+  GemmContext context;
+  GemmWithOutputPipeline<std::uint8_t, std::int32_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(), &result_raw_int32, lhs_offset,
+      rhs_offset, empty_pipeline);
+
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      std::int32_t expected = 0;
+      for (int d = 0; d < depth; d++) {
+        std::int32_t lhs_val =
+            static_cast<std::int32_t>(lhs(r, d)) + lhs_offset;
+        std::int32_t rhs_val =
+            static_cast<std::int32_t>(rhs(d, c)) + rhs_offset;
+        expected += lhs_val * rhs_val;
+      }
+      Check(expected == result_raw_int32(r, c));
+    }
+  }
+
+  // Test a pipeline with only the quantize-down stage, still returning
+  // unclamped (but scaled) int32's
+  OutputStageQuantizeDownInt32ToUint8Scale quantize_down_stage;
+  quantize_down_stage.result_offset = result_offset;
+  quantize_down_stage.result_mult_int = result_mult_int;
+  quantize_down_stage.result_shift = result_shift;
+  auto quantize_down_pipeline = std::make_tuple(quantize_down_stage);
+  Matrix<std::int32_t, ResultOrder> result_quantized_down_int32(rows, cols);
+  GemmWithOutputPipeline<std::uint8_t, std::int32_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(), &result_quantized_down_int32,
+      lhs_offset, rhs_offset, quantize_down_pipeline);
+
+  std::uint64_t sum = 0;
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      std::int32_t raw = result_raw_int32(r, c);
+      const std::int32_t rounding =
+          (result_shift < 1) ? 0 : (1 << (result_shift - 1));
+      std::int32_t expected =
+          ((raw + result_offset) * result_mult_int + rounding) >> result_shift;
+      Check(expected == result_quantized_down_int32(r, c));
+      sum += expected;
+    }
+  }
+  std::uint64_t avg = sum / (rows * cols);
+  // Test that the average quantized-down value falls reasonably in the
+  // middle of the [0..255] range. Otherwise, the multiplier / shift need to be
+  // adjusted.
+  Check(avg >= 64 && avg <= 192);
+
+  // Test the familiar default pipeline consisting of quantize-down and
+  // clamp-and-cast-to-uint8.
+  OutputStageSaturatingCastToUint8 saturating_cast_stage;
+  auto quantize_down_and_saturating_cast_pipeline =
+      std::make_tuple(quantize_down_stage, saturating_cast_stage);
+  Matrix<std::uint8_t, ResultOrder> result_quantized_down_saturated_uint8(rows,
+                                                                          cols);
+  GemmWithOutputPipeline<std::uint8_t, std::uint8_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(),
+      &result_quantized_down_saturated_uint8, lhs_offset, rhs_offset,
+      quantize_down_and_saturating_cast_pipeline);
+
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      std::int32_t quantized = result_quantized_down_int32(r, c);
+      std::uint8_t expected = std::min(std::max(quantized, 0), 255);
+      Check(expected == result_quantized_down_saturated_uint8(r, c));
+    }
+  }
+
+  // Test a bias-addition with row-vector
+  std::vector<std::int32_t> row_vector_data(cols);
+  for (int i = 0; i < cols; i++) {
+    row_vector_data[i] = (Random() % 1000) - 500;
+  }
+  typedef VectorMap<std::int32_t, VectorShape::Row> RowVectorMap;
+  RowVectorMap row_vector_map(row_vector_data.data(), cols);
+  OutputStageBiasAddition<RowVectorMap> row_bias_addition_stage;
+  row_bias_addition_stage.bias_vector = row_vector_map;
+  auto row_bias_addition_pipeline = std::make_tuple(row_bias_addition_stage);
+  Matrix<std::int32_t, ResultOrder> result_of_row_bias_addition(rows, cols);
+  GemmWithOutputPipeline<std::uint8_t, std::int32_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(), &result_of_row_bias_addition,
+      lhs_offset, rhs_offset, row_bias_addition_pipeline);
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      std::int32_t expected = result_raw_int32(r, c) + row_vector_data[c];
+      Check(expected == result_of_row_bias_addition(r, c));
+    }
+  }
+
+  // Test a bias-addition with column-vector
+  std::vector<std::int32_t> col_vector_data(rows);
+  for (int i = 0; i < rows; i++) {
+    col_vector_data[i] = (Random() % 1000) - 500;
+  }
+  typedef VectorMap<std::int32_t, VectorShape::Col> ColVectorMap;
+  ColVectorMap col_vector_map(col_vector_data.data(), rows);
+  OutputStageBiasAddition<ColVectorMap> col_bias_addition_stage;
+  col_bias_addition_stage.bias_vector = col_vector_map;
+  auto col_bias_addition_pipeline = std::make_tuple(col_bias_addition_stage);
+  Matrix<std::int32_t, ResultOrder> result_of_col_bias_addition(rows, cols);
+  GemmWithOutputPipeline<std::uint8_t, std::int32_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(), &result_of_col_bias_addition,
+      lhs_offset, rhs_offset, col_bias_addition_pipeline);
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      std::int32_t expected = result_raw_int32(r, c) + col_vector_data[r];
+      Check(expected == result_of_col_bias_addition(r, c));
+    }
+  }
+
+  // Test a clamp
+  OutputStageClamp clamp_stage;
+  // Determine min and max of raw int32 accumulators
+  std::int32_t raw_min = std::numeric_limits<std::int32_t>::max();
+  std::int32_t raw_max = std::numeric_limits<std::int32_t>::min();
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      raw_min = std::min(raw_min, result_raw_int32(r, c));
+      raw_max = std::max(raw_max, result_raw_int32(r, c));
+    }
+  }
+  // Pick some interesting clamp min/max bounds
+  clamp_stage.min = static_cast<std::int32_t>(raw_min * 0.7 + raw_max * 0.3);
+  clamp_stage.max = static_cast<std::int32_t>(raw_min * 0.3 + raw_max * 0.7);
+  assert(raw_min <= clamp_stage.min && clamp_stage.min <= clamp_stage.max &&
+         clamp_stage.max <= raw_max);
+  auto clamp_pipeline = std::make_tuple(clamp_stage);
+  Matrix<std::int32_t, ResultOrder> result_clamped(rows, cols);
+  GemmWithOutputPipeline<std::uint8_t, std::int32_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(), &result_clamped, lhs_offset,
+      rhs_offset, clamp_pipeline);
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      std::int32_t raw = result_raw_int32(r, c);
+      std::int32_t expected =
+          std::min(std::max(raw, clamp_stage.min), clamp_stage.max);
+      Check(expected == result_clamped(r, c));
+    }
+  }
+
+  // Test tanh
+  OutputStageTanh tanh_stage;
+  const std::int32_t real_zero_as_int32 = (raw_max + raw_min) / 2;
+  const std::int32_t real_amplitude_as_int32 = (raw_max - raw_min) / 16;
+  tanh_stage.real_zero_as_int32 = real_zero_as_int32;
+  tanh_stage.real_amplitude_as_int32 = real_amplitude_as_int32;
+  auto tanh_pipeline = std::make_tuple(tanh_stage);
+  Matrix<std::int32_t, ResultOrder> result_tanh(rows, cols);
+  GemmWithOutputPipeline<std::uint8_t, std::int32_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(), &result_tanh, lhs_offset,
+      rhs_offset, tanh_pipeline);
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      std::int32_t raw = result_raw_int32(r, c);
+      double real_input =
+          double(raw - real_zero_as_int32) / real_amplitude_as_int32;
+      double expected = std::tanh(real_input);
+      std::int32_t actual_int32 = result_tanh(r, c);
+      double actual =
+          double(actual_int32 - real_zero_as_int32) / real_amplitude_as_int32;
+      Check(std::abs(expected - actual) < 2e-4);
+    }
+  }
+
+  // Test a pipeline with bias and clamp
+  auto bias_clamp_pipeline =
+      std::make_tuple(col_bias_addition_stage, clamp_stage);
+  Matrix<std::int32_t, ResultOrder> result_biased_clamped(rows, cols);
+  GemmWithOutputPipeline<std::uint8_t, std::int32_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(), &result_biased_clamped,
+      lhs_offset, rhs_offset, bias_clamp_pipeline);
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      std::int32_t raw = result_raw_int32(r, c);
+      std::int32_t biased = raw + col_vector_data[r];
+      std::int32_t expected =
+          std::min(std::max(biased, clamp_stage.min), clamp_stage.max);
+      Check(expected == result_biased_clamped(r, c));
+    }
+  }
+
+  // Test a full pipeline with bias and clamp and quantization down to 8bit
+  // result
+  auto bias_clamp_quantize_cast_pipeline =
+      std::make_tuple(col_bias_addition_stage, clamp_stage, quantize_down_stage,
+                      saturating_cast_stage);
+  Matrix<std::uint8_t, ResultOrder> result_biased_clamped_quantized_casted(
+      rows, cols);
+  GemmWithOutputPipeline<std::uint8_t, std::uint8_t, DefaultL8R8BitDepthParams>(
+      &context, lhs.const_map(), rhs.const_map(),
+      &result_biased_clamped_quantized_casted, lhs_offset, rhs_offset,
+      bias_clamp_quantize_cast_pipeline);
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      const std::int32_t rounding =
+          (result_shift < 1) ? 0 : (1 << (result_shift - 1));
+      std::int32_t quantized =
+          ((result_biased_clamped(r, c) + result_offset) * result_mult_int +
+           rounding) >>
+          result_shift;
+      std::uint8_t expected = std::min(std::max(quantized, 0), 255);
+      Check(expected == result_biased_clamped_quantized_casted(r, c));
+    }
+  }
+
+  printf("TestOutputStages: PASS with ResultOrder=%s\n",
+         OrderName(ResultOrder));
+}
+
+#ifndef GEMMLOWP_SKIP_EXHAUSTIVE_TESTS
+void TestExhaustively() {
   GemmContext context;
 
   // Test the internal GEMM interfaces
-  test_gemm<SingleThreadGemmWrapper<DefaultKernelForGemm<BitDepthSetting::L8R8>,
-                                    std::uint8_t, BitDepthSetting::L8R8>>(
-      &context);
+  test_gemm<SingleThreadGemmWrapper<
+      DefaultKernel<KernelFamily::Gemm, DefaultL8R8BitDepthParams>,
+      std::uint8_t, DefaultL8R8BitDepthParams>>(&context);
 
-  test_gemm<MultiThreadGemmWrapper<DefaultKernelForGemm<BitDepthSetting::L8R8>,
-                                   std::uint8_t, BitDepthSetting::L8R8>>(
-      &context);
+  test_gemm<MultiThreadGemmWrapper<
+      DefaultKernel<KernelFamily::Gemm, DefaultL8R8BitDepthParams>,
+      std::uint8_t, DefaultL8R8BitDepthParams>>(&context);
 
   // Test the public GEMM interfaces
-  test_gemm<PublicGemmWrapper<uint8_t, BitDepthSetting::L8R8>>(&context);
+  test_gemm<PublicGemmWrapper<uint8_t, DefaultL8R8BitDepthParams>>(&context);
 
   test_gemm<EightBitIntGemmWrapper<uint8_t,
                                    eight_bit_int_gemm::BitDepthSetting::A8B8>>(
       &context);
 
   // Test GEMV cases (internal interfaces)
-  test_gemv<SingleThreadGemmWrapper<DefaultKernelForGemv<BitDepthSetting::L8R8>,
-                                    std::uint8_t, BitDepthSetting::L8R8>>(
-      &context);
+  test_gemv<SingleThreadGemmWrapper<
+      DefaultKernel<KernelFamily::Gemv, DefaultL8R8BitDepthParams>,
+      std::uint8_t, DefaultL8R8BitDepthParams>>(&context);
 
-  test_gemv<MultiThreadGemmWrapper<DefaultKernelForGemv<BitDepthSetting::L8R8>,
-                                   std::uint8_t, BitDepthSetting::L8R8>>(
-      &context);
+  test_gemv<MultiThreadGemmWrapper<
+      DefaultKernel<KernelFamily::Gemv, DefaultL8R8BitDepthParams>,
+      std::uint8_t, DefaultL8R8BitDepthParams>>(&context);
 
   // Test GEMV cases (public interfaces)
-  test_gemv<PublicGemmWrapper<uint8_t, BitDepthSetting::L8R8>>(&context);
+  test_gemv<PublicGemmWrapper<uint8_t, DefaultL8R8BitDepthParams>>(&context);
 
   test_gemv<EightBitIntGemmWrapper<uint8_t,
                                    eight_bit_int_gemm::BitDepthSetting::A8B8>>(
@@ -760,18 +1354,17 @@ void test() {
 
   // Test other bit depths
   // L7R5
-  for (int foo = 0; foo < 4; foo++) {
-    test_gemm<
-        SingleThreadGemmWrapper<DefaultKernelForGemm<BitDepthSetting::L7R5>,
-                                std::uint8_t, BitDepthSetting::L7R5>>(&context);
+  test_gemm<SingleThreadGemmWrapper<
+      DefaultKernel<KernelFamily::Gemm, DefaultL7R5BitDepthParams>,
+      std::uint8_t, DefaultL7R5BitDepthParams>>(&context);
 
-    test_gemv<
-        SingleThreadGemmWrapper<DefaultKernelForGemv<BitDepthSetting::L7R5>,
-                                std::uint8_t, BitDepthSetting::L7R5>>(&context);
+  test_gemv<SingleThreadGemmWrapper<
+      DefaultKernel<KernelFamily::Gemv, DefaultL7R5BitDepthParams>,
+      std::uint8_t, DefaultL7R5BitDepthParams>>(&context);
 
-    test_gemm<EightBitIntGemmWrapper<
-        std::uint8_t, eight_bit_int_gemm::BitDepthSetting::A5B7>>(&context);
-  }
+  test_gemm<EightBitIntGemmWrapper<std::uint8_t,
+                                   eight_bit_int_gemm::BitDepthSetting::A5B7>>(
+      &context);
 
   // Test specific kernels with various different formats,
   // to exercises corner cases especially in the packing code.
@@ -813,11 +1406,34 @@ void test() {
   test_gemm_kernel<ReferenceKernel<KernelFormat<
       KernelSideFormat<CellFormat<1, 4, CellOrder::DepthMajor>, 1>,
       KernelSideFormat<CellFormat<4, 4, CellOrder::Diagonal>, 1>>>>(&context);
+}
+#endif  // not GEMMLOWP_SKIP_EXHAUSTIVE_TESTS
+
+void test() {
+#ifdef GEMMLOWP_TEST_PROFILE
+  RegisterCurrentThreadForProfiling();
+  StartProfiling();
+#endif
+
+  // Run a first quick test against hand-calculated data.
+  TestWithSmallData();
+
+#ifndef GEMMLOWP_SKIP_EXHAUSTIVE_TESTS
+  TestExhaustively();
+#endif
 
   // Run against actual data from a network evaluation.
   TestWithRealData(eight_bit_int_gemm::BitDepthSetting::A8B8, 0, 0);
   TestWithRealData(eight_bit_int_gemm::BitDepthSetting::A5B7, 2, 10);
 
+  // Test non-default output pipelines with various combinations of
+  // output stages.
+  TestOutputStages<MapOrder::RowMajor>(63, 10, 127, 5, 17, 14);
+  TestOutputStages<MapOrder::ColMajor>(63, 10, 127, 5, 17, 14);
+
+  // Test per channel quantization.
+  TestWithSmallDataPerChannelQuantization();
+  TestWithLargeDataPerChannelQuantization();
 #ifdef GEMMLOWP_TEST_PROFILE
   FinishProfiling();
 #endif
@@ -832,4 +1448,7 @@ void test() {
 
 }  // end namespace gemmlowp
 
+// For iOS, we need to define our own main(), so skip it here.
+#if !(defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_IPHONE_SIMULATOR))
 int main() { gemmlowp::test(); }
+#endif

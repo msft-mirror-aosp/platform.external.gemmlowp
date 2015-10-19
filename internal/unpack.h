@@ -20,6 +20,7 @@
 
 #include "allocator.h"
 #include "block_params.h"
+#include "output.h"
 #include "pack.h"
 
 #include <cmath>
@@ -55,7 +56,7 @@ class PackedResult {
 };
 
 template <std::uint32_t numerator, std::uint32_t denominator>
-std::int32_t MultiplyByConstantFraction(std::int32_t x) {
+std::int32_t RoundingMultiplyByConstantFraction(std::int32_t x) {
   if (numerator == denominator) {
     return x;
   }
@@ -70,7 +71,8 @@ std::int32_t MultiplyByConstantFraction(std::int32_t x) {
       numerator - int_quotient * denominator;
   static const std::int32_t scaled_remaining_numerator =
       static_cast<std::int32_t>(
-          (static_cast<std::int64_t>(remaining_numerator) << 31) / denominator);
+          (static_cast<std::int64_t>(remaining_numerator) * (1ll << 31)) /
+          denominator);
 
   const std::int64_t scaled_remaining_product =
       static_cast<std::int64_t>(x) *
@@ -79,66 +81,78 @@ std::int32_t MultiplyByConstantFraction(std::int32_t x) {
   const std::int32_t scaled_remaining_product_nudge =
       (scaled_remaining_product > 0 ? 1 : -1) * (1 << 30);
 
-  const std::int32_t remaining_product =
-      (scaled_remaining_product + scaled_remaining_product_nudge) / (1u << 31);
+  const std::int32_t remaining_product = static_cast<std::int32_t>(
+      (scaled_remaining_product + scaled_remaining_product_nudge) / (1u << 31));
 
   return x * int_quotient + remaining_product;
 }
 
-template <BitDepthSetting BitDepth, 
-  typename ResultBlockType, typename PackedResultType>
+template <typename BitDepthParams, typename ResultBlockType,
+          typename PackedResultType, typename LhsOffset, typename RhsOffset,
+          typename OutputPipelineType>
 struct UnpackResultImplGeneric {
   static void Unpack(ResultBlockType* dst, const PackedResultType& src,
-                     int depth, const std::int32_t* lhs_rank_one_update,
-                     const std::int32_t* rhs_rank_one_update,
-                     std::int32_t lhs_offset, std::int32_t rhs_offset,
-                     std::int32_t result_offset, std::int32_t result_mult_int,
-                     std::int32_t result_shift) {
-    std::int32_t term_11 = lhs_offset * rhs_offset * depth + result_offset;
+                     int depth, const std::int32_t* lhs_sums_of_each_slice,
+                     const std::int32_t* rhs_sums_of_each_slice,
+                     const LhsOffset& lhs_offset, const RhsOffset& rhs_offset,
+                     const OutputPipelineType& output_pipeline) {
     auto src_map = src.Map();
     // No top-level blocking in the depth dimension at the moment.
     // Too much loss of precision.
-    const int kLhsBits = LhsBitDepth<BitDepth>::kBits;
-    const int kRhsBits = RhsBitDepth<BitDepth>::kBits;
+    const int kLhsBits = BitDepthParams::LhsBitDepth::kBits;
+    const int kRhsBits = BitDepthParams::RhsBitDepth::kBits;
     const std::int32_t kLhsMax = (1 << kLhsBits) - 1;
     const std::int32_t kRhsMax = (1 << kRhsBits) - 1;
+    OutputPipelineExecutor<OutputPipelineType, FragmentInt32x1x1>
+        output_pipeline_executor(output_pipeline);
     for (int c = 0; c < dst->cols(); c++) {
       for (int r = 0; r < dst->rows(); r++) {
+        // To understand this code, read
+        //   doc/low-precision.txt
+        //   doc/less-than-8-bit.txt
+        // We have 4 terms to sum: xx, x1, 1x, 11.
+        // In case of requantization, we first need to scale them back
+        // to the original scale, using RoundingMultiplyByConstantFraction.
         std::int32_t raw_xx = src_map(r, c);
-        std::int32_t raw_x1 = lhs_rank_one_update[r];
-        std::int32_t raw_1x = rhs_rank_one_update[c];
+        std::int32_t raw_x1 = lhs_sums_of_each_slice[r] * rhs_offset(c);
+        std::int32_t raw_1x = rhs_sums_of_each_slice[c] * lhs_offset(r);
         std::int32_t term_xx =
-            MultiplyByConstantFraction<255 * 255, kLhsMax * kRhsMax>(raw_xx);
+            RoundingMultiplyByConstantFraction<255 * 255, kLhsMax * kRhsMax>(
+                raw_xx);
         std::int32_t term_x1 =
-            MultiplyByConstantFraction<255, kLhsMax>(raw_x1);
+            RoundingMultiplyByConstantFraction<255, kLhsMax>(raw_x1);
         std::int32_t term_1x =
-            MultiplyByConstantFraction<255, kRhsMax>(raw_1x);
-        std::int32_t sum = term_xx + term_x1 + term_1x + term_11;
-        std::int32_t result =
-            (sum * result_mult_int + (1 << (result_shift - 1))) >> result_shift;
-        (*dst)(r, c) = result > 255 ? 255 : result < 0 ? 0 : result;
+            RoundingMultiplyByConstantFraction<255, kRhsMax>(raw_1x);
+        std::int32_t term_11 = lhs_offset(r) * rhs_offset(c) * depth;
+        // Sum the 4 terms.
+        FragmentInt32x1x1 sum = term_xx + term_x1 + term_1x + term_11;
+
+        output_pipeline_executor.Execute(sum, dst, r, c);
       }
     }
   }
 };
 
-template <BitDepthSetting BitDepth, 
-  typename ResultBlockType, typename PackedResultType>
+template <typename BitDepthParams, typename ResultBlockType,
+          typename PackedResultType, typename LhsOffset, typename RhsOffset,
+          typename OutputPipelineType>
 struct UnpackResultImpl
-    : UnpackResultImplGeneric<BitDepth, ResultBlockType, PackedResultType> {};
+    : UnpackResultImplGeneric<BitDepthParams, ResultBlockType, PackedResultType,
+                              LhsOffset, RhsOffset, OutputPipelineType> {};
 
-template <BitDepthSetting BitDepth, 
-  typename ResultBlockType, typename PackedResultType>
+template <typename BitDepthParams, typename ResultBlockType,
+          typename PackedResultType, typename LhsOffset, typename RhsOffset,
+          typename OutputPipelineType>
 void UnpackResult(ResultBlockType* dst, const PackedResultType& src, int depth,
-                  const std::int32_t* lhs_rank_one_update,
-                  const std::int32_t* rhs_rank_one_update,
-                  std::int32_t lhs_offset, std::int32_t rhs_offset,
-                  std::int32_t result_offset, std::int32_t result_mult_int,
-                  std::int32_t result_shift) {
+                  const std::int32_t* lhs_sums_of_each_slice,
+                  const std::int32_t* rhs_sums_of_each_slice,
+                  const LhsOffset& lhs_offset, const RhsOffset& rhs_offset,
+                  const OutputPipelineType& output_pipeline) {
   ScopedProfilingLabel label("unpack");
-  UnpackResultImpl<BitDepth, ResultBlockType, PackedResultType>::Unpack(
-      dst, src, depth, lhs_rank_one_update, rhs_rank_one_update, lhs_offset,
-      rhs_offset, result_offset, result_mult_int, result_shift);
+  UnpackResultImpl<BitDepthParams, ResultBlockType, PackedResultType,
+                   LhsOffset, RhsOffset, OutputPipelineType>::Unpack(
+      dst, src, depth, lhs_sums_of_each_slice, rhs_sums_of_each_slice,
+      lhs_offset, rhs_offset, output_pipeline);
 }
 
 }  // namespace gemmlowp

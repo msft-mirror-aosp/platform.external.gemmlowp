@@ -20,39 +20,93 @@
 
 #include <pthread.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
-#include <algorithm>
 
 #include "../profiling/instrumentation.h"
 
-#ifdef GEMMLOWP_PROFILING
-#include <set>
-#include <cstdio>
-#include <cstring>
+// Our inline assembly path assume GCC/Clang syntax.
+// Native Client doesn't seem to support inline assembly(?).
+#if defined(__GNUC__) && !defined(__native_client__)
+#define GEMMLOWP_ALLOW_INLINE_ASM
 #endif
+
+// Define macro statement that avoids inlining for GCC.
+// For non-GCC, define as empty macro.
+#if defined(__GNUC__)
+#define GEMMLOWP_NOINLINE __attribute__((noinline))
+#else
+#define GEMMLOWP_NOINLINE
+#endif
+
+// Detect ARM, 32-bit or 64-bit
+#ifdef __arm__
+#define GEMMLOWP_ARM_32
+#endif
+
+#ifdef __aarch64__
+#define GEMMLOWP_ARM_64
+#endif
+
+#if defined(GEMMLOWP_ARM_32) || defined(GEMMLOWP_ARM_64)
+#define GEMMLOWP_ARM
+#endif
+
+// Detect x86, 32-bit or 64-bit
+#if defined(__i386__) || defined(_M_IX86) || defined(_X86_) || defined(__i386)
+#define GEMMLOWP_X86_32
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__amd64)
+#define GEMMLOWP_X86_64
+#endif
+
+#if defined(GEMMLOWP_X86_32) || defined(GEMMLOWP_X86_64)
+#define GEMMLOWP_X86
+#endif
+
+// Some of our optimized paths use inline assembly and for
+// now we don't bother enabling some other optimized paths using intrinddics
+// where we can't use inline assembly paths.
+#ifdef GEMMLOWP_ALLOW_INLINE_ASM
 
 // Detect NEON. It's important to check for both tokens.
 #if (defined __ARM_NEON) || (defined __ARM_NEON__)
 #define GEMMLOWP_NEON
-#ifdef __arm__
-#define GEMMLOWP_NEON32
-#endif
-#ifdef __aarch64__
-#define GEMMLOWP_NEON64
-#endif
 #endif
 
-// Detect SSE.
-#if defined __SSE4_2__  // at the moment, our SSE code assumes SSE 4.something
-#define GEMMLOWP_SSE
-#if defined(__i386__) || defined(_M_IX86) || defined(_X86_) || defined(__i386)
-#define GEMMLOWP_SSE32
+// Convenience NEON tokens for 32-bit or 64-bit
+#if defined(GEMMLOWP_NEON) && defined(GEMMLOWP_ARM_32)
+#define GEMMLOWP_NEON_32
 #endif
-#if defined(__x86_64__) || defined(_M_X64) || defined(__amd64)
-#define GEMMLOWP_SSE64
+
+#if defined(GEMMLOWP_NEON) && defined(GEMMLOWP_ARM_64)
+#define GEMMLOWP_NEON_64
 #endif
+
+// Detect SSE4.
+#if defined __SSE4_1__
+#define GEMMLOWP_SSE4
+#endif
+
+// Convenience SSE4 tokens for 32-bit or 64-bit
+#if defined(GEMMLOWP_SSE4) && defined(GEMMLOWP_X86_32)
+#define GEMMLOWP_SSE4_32
+#endif
+
+#if defined(GEMMLOWP_SSE4) && defined(GEMMLOWP_X86_64)
+#define GEMMLOWP_SSE4_64
+#endif
+
+#endif  // GEMMLOWP_ALLOW_INLINE_ASM
+
+// Detect Android. Don't conflate with ARM - we care about tuning
+// for non-ARM Android devices too. This can be used in conjunction
+// with x86 to tune differently for mobile x86 CPUs (Atom) vs. desktop x86 CPUs.
+#if defined(__ANDROID__) || defined(ANDROID)
+#define GEMMLOWP_ANDROID
 #endif
 
 namespace gemmlowp {
@@ -64,7 +118,12 @@ namespace gemmlowp {
 // which should be acceptable.
 const int kDefaultCacheLineSize = 64;
 
-// Default L1 and L2 data cache sizes. On x86, we should ideally query this at
+// Default L1 and L2 data cache sizes.
+// The L1 cache size is assumed to be for each core.
+// The L2 cache size is assumed to be shared among all cores. What
+// we call 'L2' here is effectively top-level cache.
+//
+// On x86, we should ideally query this at
 // runtime. On ARM, the instruction to query this is privileged and
 // Android kernels do not expose it to userspace. Fortunately, the majority
 // of ARM devices have roughly comparable values:
@@ -72,22 +131,44 @@ const int kDefaultCacheLineSize = 64;
 //   Android One: L1 32k, L2 512k
 // The following values are equal to or somewhat lower than that, and were
 // found to perform well on both the Nexus 5 and Android One.
-// Of course, they would be too low for typical x86 CPUs where we would want
-// to set the L2 value to (L3 cache size / number of cores) at least.
+// Of course, these values are in principle too low for typical x86 CPUs
+// where we should set the L2 value to (L3 cache size / number of cores) at
+// least.
+#if defined(GEMMLOWP_ARM) || defined(GEMMLOWP_ANDROID)
+// ARM or ARM-like hardware (Android implies ARM-like) so here it's OK
+// to tune for ARM, although on x86 Atom we might be able to query
+// cache sizes at runtime, which would be better.
 const int kDefaultL1CacheSize = 16 * 1024;
 const int kDefaultL2CacheSize = 384 * 1024;
+#elif defined(GEMMLOWP_X86_64)
+// x86-64 and not Android. Therefore, likely desktop-class x86 hardware.
+// Thus we assume larger cache sizes, though we really should query
+// them at runtime.
+const int kDefaultL1CacheSize = 32 * 1024;
+const int kDefaultL2CacheSize = 4 * 1024 * 1024;
+#elif defined(GEMMLOWP_X86_32)
+// x86-32 and not Android. Same as x86-64 but less bullish.
+const int kDefaultL1CacheSize = 32 * 1024;
+const int kDefaultL2CacheSize = 2 * 1024 * 1024;
+#else
+// Less common hardware. Maybe some unusual or older or embedded thing.
+// Assume smaller caches, but don't depart too far from what we do
+// on ARM/Android to avoid accidentally exposing unexpected behavior.
+const int kDefaultL1CacheSize = 16 * 1024;
+const int kDefaultL2CacheSize = 256 * 1024;
+#endif
 
 // The proportion of the cache that we intend to use for storing
 // RHS blocks. This should be between 0 and 1, and typically closer to 1,
 // as we typically want to use most of the L2 cache for storing a large
 // RHS block.
-// Note: with less-than-8-bit depth, requantization makes packing more
-// expensive. We lowered this value from 0.9 to 0.75 with the introduction
-// of expensive requantization; this results in much higher performance
-// for 1000x1000 matrices; the exact reason for that is not understood.
-// Anyway, clearly we will eventually need better heuristics than just
-// those constant parameters here.
+#if defined(GEMMLOWP_X86)
+// For IA, use the entire L2 cache for the RHS matrix. LHS matrix is not blocked
+// for L2 cache.
+const float kDefaultL2RhsFactor = 1.00f;
+#else
 const float kDefaultL2RhsFactor = 0.75f;
+#endif
 
 // The number of bytes in a SIMD register. This is used to determine
 // the dimensions of PackingRegisterBlock so that such blocks can
@@ -99,32 +180,9 @@ const float kDefaultL2RhsFactor = 0.75f;
 // are consistent with this value.
 const int kRegisterSize = 16;
 
-// The threshold on the depth dimension at which we switch to
-// probabilistic rounding instead of rounding-to-nearest when
-// requantizing input data. Indeed, both statistical theory and
-// empirical measurements show that for given input data and bit depth,
-// probabilistic rounding gives more accurate results for large enough
-// depth, while rounding-to-nearest does for smaller depth. This threshold
-// is naively determined from some experiments with Inception at 7bit/5bit
-// on a set of 10,000 images:
-//
-//   7 bit weights, 5 bit activations, switch at 64:   59.82% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 128:  59.58% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 192:  63.37% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 256:  63.47% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 320:  63.71% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 384:  63.71% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 448:  63.58% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 512:  64.10% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 640:  62.49% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 768:  62.49% top-1 accuracy
-//   7 bit weights, 5 bit activations, switch at 1024: 58.96% top-1 accuracy
-//
-// So here, 384 looks comfortably in the middle of a plateau of good values,
-// and it's a roundish number (3/2 * 256) so let's stick with that for now.
-// It would be nice to work out the theory of this, and understand how this
-// should depend on the distribution of inputs and the bit depth.
-const int kProbabilisticRoundingThreshold = 384;
+// Requantization to less-than-8-bit is costly, so it only worth
+// doing if the GEMM width is large enough
+const int kMinimumWidthForRequantization = 100;
 
 // Hints the CPU to prefetch the cache line containing ptr.
 inline void Prefetch(const void* ptr) {
@@ -137,15 +195,15 @@ inline void Prefetch(const void* ptr) {
 
 // Returns the runtime argument rounded down to the nearest multiple of
 // the fixed Modulus.
-template <int Modulus>
-int RoundDown(int i) {
+template <unsigned Modulus, typename Integer>
+Integer RoundDown(Integer i) {
   return i - (i % Modulus);
 }
 
 // Returns the runtime argument rounded up to the nearest multiple of
 // the fixed Modulus.
-template <int Modulus>
-int RoundUp(int i) {
+template <unsigned Modulus, typename Integer>
+Integer RoundUp(Integer i) {
   return RoundDown<Modulus>(i + Modulus - 1);
 }
 

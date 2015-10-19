@@ -18,6 +18,15 @@ This is not an official Google product (experimental or otherwise), it is just
 code that happens to be owned by Google.
 
 
+Mailing list
+============
+
+gemmlowp-related discussion, about either development or usage, is welcome
+on this Google Group (mailing list / forum):
+
+  https://groups.google.com/forum/#!forum/gemmlowp
+
+
 Portability, target platforms/architectures
 ===========================================
 
@@ -79,6 +88,9 @@ Public interfaces
     eight_bit_int_gemm/eight_bit_int_gemm.h
   This is *NOT* a headers-only library, users need to link to
     eight_bit_int_gemm/eight_bit_int_gemm.cc.
+  The API is similar to the standard BLAS GEMM interface, and implements
+  C = A * B. If the transpose flags for a matrix argument are false, its memory
+  order is treated as column major, and row major if its true.
 
 
 Building
@@ -216,6 +228,18 @@ It relies on source code being instrumented with pseudo-stack labels.
 See profiling/instrumentation.h.
 A full example of using this profiler is given in profiling/profiler.h.
 
+
+Contributing
+============
+
+Contribution-related discussion is always welcome on the gemmlowp
+mailing list (see above).
+
+We try to keep a current list of TODO items in the todo/ directory.
+Prospective contributors are welcome to pick one to work on, and
+communicate about it on the gemmlowp mailing list.
+
+Details of the contributing process, including legalese, are in CONTRIBUTING.
 
 Performance goals
 =================

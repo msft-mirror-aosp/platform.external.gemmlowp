@@ -27,6 +27,96 @@
 
 namespace gemmlowp {
 
+#ifdef GEMMLOWP_ALLOW_INLINE_ASM
+// Where inline asm is allowed, we use some busy-waiting,
+// preferably implemented using NOP instructions.
+const int kMaxBusyWaitNOPs = 32 * 1000 * 1000;
+
+#define GEMMLOWP_NOP "nop\n"
+
+#define GEMMLOWP_STRING_CONCAT_4(X) X X X X
+#define GEMMLOWP_NOP4 GEMMLOWP_STRING_CONCAT_4(GEMMLOWP_NOP)
+#define GEMMLOWP_NOP16 GEMMLOWP_STRING_CONCAT_4(GEMMLOWP_NOP4)
+#define GEMMLOWP_NOP64 GEMMLOWP_STRING_CONCAT_4(GEMMLOWP_NOP16)
+#define GEMMLOWP_NOP256 GEMMLOWP_STRING_CONCAT_4(GEMMLOWP_NOP64)
+
+inline int Do256NOPs() {
+  asm volatile(GEMMLOWP_NOP256);
+  return 256;
+}
+
+#undef GEMMLOWP_STRING_CONCAT_4
+#undef GEMMLOWP_NOP256
+#undef GEMMLOWP_NOP64
+#undef GEMMLOWP_NOP16
+#undef GEMMLOWP_NOP4
+#undef GEMMLOWP_NOP
+
+#else  // not GEMMLOWP_ALLOW_INLINE_ASM
+
+// It is nontrivial to implement a good busy-waiting without
+// using asm; NOP instructions have the least side effects
+// and the lowest power usage; and since the whole busy-waiting
+// story is an optimization, it's not very interesting anyway
+// in places where we're slow anyway due to not being able to
+// use our inline asm kernels.
+
+const int kMaxBusyWaitNOPs = 0;
+inline int Do256NOPs() { return 0; }
+
+#endif  // not GEMMLOWP_ALLOW_INLINE_ASM
+
+// Waits until *var != initial_value.
+//
+// Returns the new value of *var. The guarantee here is that
+// the return value is different from initial_value, and that that
+// new value has been taken by *var at some point during the
+// execution of this function. There is no guarantee that this is
+// still the value of *var when this function returns, since *var is
+// not assumed to be guarded by any lock.
+//
+// First does some busy-waiting for a fixed number of no-op cycles,
+// then falls back to passive waiting for the given condvar, guarded
+// by the given mutex.
+//
+// The idea of doing some initial busy-waiting is to help get
+// better and more consistent multithreading benefits for small GEMM sizes.
+// Busy-waiting help ensuring that if we need to wake up soon after having
+// started waiting, then we can wake up quickly (as opposed to, say,
+// having to wait to be scheduled again by the OS). On the other hand,
+// we must still eventually revert to passive waiting for longer waits
+// (e.g. worker threads having finished a GEMM and waiting until the next GEMM)
+// so as to avoid permanently spinning.
+//
+template <typename T>
+T WaitForVariableChange(volatile T* var, T initial_value, pthread_cond_t* cond,
+                        pthread_mutex_t* mutex) {
+  int nops = 0;
+  // First, trivial case where the variable already changed value.
+  T new_value = *var;
+  if (new_value != initial_value) {
+    return new_value;
+  }
+  // Then try busy-waiting.
+  while (nops < kMaxBusyWaitNOPs) {
+    nops += Do256NOPs();
+    new_value = *var;
+    if (new_value != initial_value) {
+      return new_value;
+    }
+  }
+  // Finally, do real passive waiting.
+  pthread_mutex_lock(mutex);
+  new_value = *var;
+  if (new_value == initial_value) {
+    pthread_cond_wait(cond, mutex);
+    new_value = *var;
+    assert(new_value != initial_value);
+  }
+  pthread_mutex_unlock(mutex);
+  return new_value;
+}
+
 // A BlockingCounter lets one thread to wait for N events to occur.
 // This is how the master thread waits for all the worker threads
 // to have finished working.
@@ -35,14 +125,16 @@ class BlockingCounter {
   BlockingCounter()
       : cond_(PTHREAD_COND_INITIALIZER),
         mutex_(PTHREAD_MUTEX_INITIALIZER),
-        count_(0) {}
+        count_(0),
+        initial_count_(0) {}
 
   // Sets/resets the counter; initial_count is the number of
   // decrementing events that the Wait() call will be waiting for.
-  void Reset(int initial_count) {
+  void Reset(std::size_t initial_count) {
     pthread_mutex_lock(&mutex_);
     assert(count_ == 0);
-    count_ = initial_count;
+    initial_count_ = initial_count;
+    count_ = initial_count_;
     pthread_mutex_unlock(&mutex_);
   }
 
@@ -66,17 +158,20 @@ class BlockingCounter {
   // to hit the BlockingCounter.
   void Wait() {
     ScopedProfilingLabel label("BlockingCounter::Wait");
-    pthread_mutex_lock(&mutex_);
     while (count_) {
-      pthread_cond_wait(&cond_, &mutex_);
+      MemoryBarrier();
+      const std::size_t count_value = count_;
+      if (count_value) {
+        WaitForVariableChange(&count_, count_value, &cond_, &mutex_);
+      }
     }
-    pthread_mutex_unlock(&mutex_);
   }
 
  private:
   pthread_cond_t cond_;
   pthread_mutex_t mutex_;
-  int count_;
+  std::size_t count_;
+  std::size_t initial_count_;
 };
 
 // A workload for a worker.
@@ -151,24 +246,10 @@ class Worker {
     // Thread main loop
     while (true) {
       // Get a state to act on
-      pthread_mutex_lock(&state_mutex_);
-      switch (state_) {
-        case State::ExitAsSoonAsPossible:
-        case State::HasWork:
-          break;
-        case State::Ready:
-          // In the 'Ready' state, we have nothing to do but to wait until
-          // we switch to another state.
-          while (state_ == State::Ready) {
-            ScopedProfilingLabel label("Worker::ThreadFunc waiting");
-            pthread_cond_wait(&state_cond_, &state_mutex_);
-          }
-          break;
-        default:
-          abort();
-      }
-      State state_to_act_upon = state_;
-      pthread_mutex_unlock(&state_mutex_);
+      // In the 'Ready' state, we have nothing to do but to wait until
+      // we switch to another state.
+      State state_to_act_upon = WaitForVariableChange(
+          &state_, State::Ready, &state_cond_, &state_mutex_);
 
       // We now have a state to act on, so act.
       switch (state_to_act_upon) {
@@ -280,28 +361,27 @@ class WorkersPool {
 // RHS has been packed by the master thread; each worker thread
 // then has to pack a block of the LHS and accumulate the Gemm of these
 // packed LHS and RHS blocks.
-template <typename KernelFormat, typename Scalar, BitDepthSetting BitDepth,
-          MapOrder LhsOrder, MapOrder RhsOrder, MapOrder ResultOrder>
+template <typename KernelFormat, typename InputScalar, typename OutputScalar,
+          typename BitDepthParams, MapOrder LhsOrder, MapOrder RhsOrder,
+          MapOrder ResultOrder, typename LhsOffset, typename RhsOffset,
+          typename OutputPipelineType>
 struct GemmWithPackedRhsTask : Task {
-  typedef PackedSideBlock<typename KernelFormat::Lhs>
-      PackedLhs;
-  typedef PackedSideBlock<typename KernelFormat::Rhs>
-      PackedRhs;
+  typedef PackedSideBlock<typename KernelFormat::Lhs> PackedLhs;
+  typedef PackedSideBlock<typename KernelFormat::Rhs> PackedRhs;
   GemmWithPackedRhsTask(const KernelBase& _kernel,
-                        const MatrixMap<const Scalar, LhsOrder>& _lhs,
+                        const MatrixMap<const InputScalar, LhsOrder>& _lhs,
                         const PackedRhs& _packed_rhs,
-                        MatrixMap<Scalar, ResultOrder>* _result,
-                        int _lhs_offset, int _rhs_offset, int _result_offset,
-                        int _result_mult_int, int _result_shift)
+                        MatrixMap<OutputScalar, ResultOrder>* _result,
+                        const LhsOffset& _lhs_offset,
+                        const RhsOffset& _rhs_offset,
+                        const OutputPipelineType& _output_pipeline)
       : kernel(_kernel),
         lhs(_lhs),
         packed_rhs(_packed_rhs),
         result(*_result),
         lhs_offset(_lhs_offset),
         rhs_offset(_rhs_offset),
-        result_offset(_result_offset),
-        result_mult_int(_result_mult_int),
-        result_shift(_result_shift) {}
+        output_pipeline(_output_pipeline) {}
 
   void Run() const override {
     ScopedProfilingLabel label("GemmWithPackedRhsTask");
@@ -313,7 +393,7 @@ struct GemmWithPackedRhsTask : Task {
     BlockParams block_params;
     block_params.Init<KernelFormat>(rows, cols, depth, 1);
 
-    PackedLhs packed_lhs(Side::Lhs, local_allocator, block_params, rhs_offset);
+    PackedLhs packed_lhs(Side::Lhs, local_allocator, block_params);
 
     PackedResult packed_result(local_allocator, block_params);
 
@@ -325,16 +405,15 @@ struct GemmWithPackedRhsTask : Task {
       for (int r = 0; r < rows; r += block_params.l2_rows) {
         int rs = std::min(block_params.l2_rows, rows - r);
 
-        PackLhs<BitDepth>(&packed_lhs, lhs.block(r, 0, rs, depth));
+        PackLhs<BitDepthParams>(&packed_lhs, lhs.block(r, 0, rs, depth));
 
         Compute(kernel, block_params, &packed_result, packed_lhs, packed_rhs);
 
         auto result_block = result.block(r, c, rs, cs);
-        UnpackResult<BitDepth>(
-          &result_block, packed_result, depth,
-          packed_lhs.rank_one_update(), packed_rhs.rank_one_update(),
-          lhs_offset, rhs_offset, result_offset, result_mult_int,
-          result_shift);
+        UnpackResult<BitDepthParams>(&result_block, packed_result, depth,
+                                     packed_lhs.sums_of_each_slice(),
+                                     packed_rhs.sums_of_each_slice(),
+                                     lhs_offset, rhs_offset, output_pipeline);
       }
     }
 
@@ -342,14 +421,12 @@ struct GemmWithPackedRhsTask : Task {
   }
 
   const KernelBase& kernel;
-  const MatrixMap<const Scalar, LhsOrder> lhs;
+  const MatrixMap<const InputScalar, LhsOrder> lhs;
   const PackedRhs packed_rhs;
-  MatrixMap<Scalar, ResultOrder> result;
-  int lhs_offset;
-  int rhs_offset;
-  int result_offset;
-  int result_mult_int;
-  int result_shift;
+  MatrixMap<OutputScalar, ResultOrder> result;
+  const LhsOffset& lhs_offset;
+  const RhsOffset& rhs_offset;
+  const OutputPipelineType& output_pipeline;
 };
 
 class MultiThreadGemmContext : public SingleThreadGemmContext {
@@ -361,6 +438,10 @@ class MultiThreadGemmContext : public SingleThreadGemmContext {
   int max_num_threads() const { return max_num_threads_; }
 
   WorkersPool* workers_pool() { return &workers_pool_; }
+
+  Allocator* main_thread_task_allocator() {
+    return &main_thread_task_allocator_;
+  }
 
  protected:
   // The workers pool used by MultiThreadGemm. Making
@@ -374,12 +455,20 @@ class MultiThreadGemmContext : public SingleThreadGemmContext {
   // detecting the number of hardware threads. Nonzero values mean
   // skipping and overriding hardware detection.
   int max_num_threads_;
+
+  // For N-threaded operations, we will use only N-1 worker threads
+  // while the last task will be run directly on the main thread.
+  // It will then use this main_thread_task_allocator_; having a
+  // dedicated allocator for that (separate from the base allocator_)
+  // allows to use the same code for all tasks regardless of which
+  // thread they run on.
+  Allocator main_thread_task_allocator_;
 };
 
-// Determines how many worker threads should be used for a given Gemm
+// Determines how many threads should be used for a given Gemm
 // operation.
 template <int KernelRows>
-inline int HowManyWorkers(MultiThreadGemmContext* context, int rows, int cols,
+inline int HowManyThreads(MultiThreadGemmContext* context, int rows, int cols,
                           int depth) {
   // First check if the user set an explicit maximum number of threads.
   int max_count = context->max_num_threads();
@@ -397,29 +486,40 @@ inline int HowManyWorkers(MultiThreadGemmContext* context, int rows, int cols,
 
   // Basic calculation: take into account max pool size, and
   // how many rows we have to feed our kernel.
-  int workers_count = std::min(max_count, CeilQuotient(rows, KernelRows));
+  // The motivation for an absolute minimum number of rows per thread,
+  // potentially higher than KernelRows, is that very thin thread workload
+  // currently defeat assumptions of the AddMod generator, resulting
+  // in substantial bias in TestWithRealData on 24 threads.
+  // Ideally, the AddMod generator should be aware of global (r,c) coordinates
+  // so as to be independent of the number of threads.
+  static const int AbsoluteMinRowsPerThread = 16;
+  static const int MinRowsPerThread = KernelRows > AbsoluteMinRowsPerThread
+                                          ? KernelRows
+                                          : AbsoluteMinRowsPerThread;
+  int thread_count = std::min(max_count, CeilQuotient(rows, MinRowsPerThread));
 
-  // At this point for small products we already have workers_count==1 so
+  // At this point for small products we already have thread_count==1 so
   // we can avoid doing more work; otherwise, we still want to check
   // that the cubic size (rows*cols*depth) is big enough to keep
   // workers_ busy.
-  if (workers_count > 1) {
+  if (thread_count > 1) {
     // Empirically determined value.
-    static const int min_cubic_size_per_thread = 256 * 1024;
+    static const std::uint64_t min_cubic_size_per_thread = 64 * 1024;
 
     // We can only multiply two out of three sizes without risking overflow
-    int cols_times_depth = cols * depth;
+    const std::uint64_t cubic_size =
+        std::uint64_t(rows) * std::uint64_t(cols) * std::uint64_t(depth);
 
-    if (cols_times_depth < min_cubic_size_per_thread) {
-      // in that case, we can multiply by rows without risking overflow
-      int cubic_size = rows * cols_times_depth;
-      workers_count = std::min(
-          workers_count, CeilQuotient(cubic_size, min_cubic_size_per_thread));
+    thread_count =
+        std::min(thread_count, int(cubic_size / min_cubic_size_per_thread));
+
+    if (thread_count < 1) {
+      thread_count = 1;
     }
   }
 
-  assert(workers_count > 0 && workers_count <= max_count);
-  return workers_count;
+  assert(thread_count > 0 && thread_count <= max_count);
+  return thread_count;
 }
 
 // The main multi-threaded Gemm function.
@@ -427,14 +527,16 @@ inline int HowManyWorkers(MultiThreadGemmContext* context, int rows, int cols,
 // The parallelization scheme used here is to have this master function
 // pack a block of RHS and then start worker threads to pack a block of LHS
 // each, and accumulate the corresponding products.
-template <typename KernelFormat, typename Scalar, BitDepthSetting BitDepth,
-          MapOrder LhsOrder, MapOrder RhsOrder, MapOrder ResultOrder>
+template <typename KernelFormat, typename InputScalar, typename OutputScalar,
+          typename BitDepthParams, MapOrder LhsOrder, MapOrder RhsOrder,
+          MapOrder ResultOrder, typename LhsOffset, typename RhsOffset,
+          typename OutputPipelineType>
 void MultiThreadGemm(MultiThreadGemmContext* context, const KernelBase& kernel,
-                     const MatrixMap<const Scalar, LhsOrder>& lhs,
-                     const MatrixMap<const Scalar, RhsOrder>& rhs,
-                     MatrixMap<Scalar, ResultOrder>* result, int lhs_offset,
-                     int rhs_offset, int result_offset, int result_mult_int,
-                     int result_shift) {
+                     const MatrixMap<const InputScalar, LhsOrder>& lhs,
+                     const MatrixMap<const InputScalar, RhsOrder>& rhs,
+                     MatrixMap<OutputScalar, ResultOrder>* result,
+                     const LhsOffset& lhs_offset, const RhsOffset& rhs_offset,
+                     const OutputPipelineType& output_pipeline) {
   ScopedProfilingLabel label("gemmlowp::MultiThreadGemm");
 
   assert(lhs.cols() == rhs.rows());
@@ -443,14 +545,29 @@ void MultiThreadGemm(MultiThreadGemmContext* context, const KernelBase& kernel,
   int cols = result->cols();
   int depth = lhs.cols();
 
-  const int workers_count =
-      HowManyWorkers<KernelFormat::kRows>(context, rows, cols, depth);
-  if (workers_count == 1) {
-    return SingleThreadGemm<KernelFormat, Scalar, BitDepth>(
-        context, kernel, lhs, rhs, result, lhs_offset, rhs_offset,
-        result_offset, result_mult_int, result_shift);
+  assert(rows > 0);
+  assert(cols > 0);
+  assert(depth > 0);
+
+  const int thread_count =
+      HowManyThreads<KernelFormat::kRows>(context, rows, cols, depth);
+  if (thread_count == 1) {
+    return SingleThreadGemm<KernelFormat, InputScalar, OutputScalar,
+                            BitDepthParams>(context, kernel, lhs, rhs, result,
+                                            lhs_offset, rhs_offset,
+                                            output_pipeline);
   }
-  assert(workers_count > 1);
+  assert(thread_count > 1);
+
+  // We choose to use a worker thread for all but one
+  // of the thread workloads. The remaining thread workload will be
+  // executed immediately on the current thread.
+  // In this way, the total number of threads (1 master, N-1 workers)
+  // equals the value returned by HowManyThread. This simple
+  // 1:1 mapping of threads to physical cores, is very important
+  // to getting good multithreaded performance especially for
+  // not-very-large GEMMs, and especially on Android.
+  const int workers_count = thread_count - 1;
 
   Allocator* allocator = context->allocator();
   WorkersPool* workers_pool = context->workers_pool();
@@ -460,8 +577,8 @@ void MultiThreadGemm(MultiThreadGemmContext* context, const KernelBase& kernel,
   BlockParams block_params;
   block_params.Init<KernelFormat>(rows, cols, depth, workers_count);
 
-  PackedSideBlock<typename KernelFormat::Rhs>
-      packed_rhs(Side::Rhs, allocator, block_params, lhs_offset);
+  PackedSideBlock<typename KernelFormat::Rhs> packed_rhs(
+      Side::Rhs, allocator, block_params);
   allocator->Commit();
 
   // We loop over large blocks of the RHS.
@@ -469,25 +586,34 @@ void MultiThreadGemm(MultiThreadGemmContext* context, const KernelBase& kernel,
     int cs = std::min(block_params.l2_cols, cols - c);
 
     // Pack a large block of the RHS.
-    PackRhs<BitDepth>(&packed_rhs, rhs.block(0, c, depth, cs));
+    PackRhs<BitDepthParams>(&packed_rhs, rhs.block(0, c, depth, cs));
 
     // Give work to each worker.
     int next_start_row = 0;
     workers_pool->counter_to_decrement_when_ready().Reset(workers_count);
-    for (int w = 0; w < workers_count; w++) {
+    for (int thread = 0; thread < thread_count; thread++) {
       int start_row = next_start_row;
-      next_start_row = std::min(
-          rows, RoundUp<KernelFormat::kRows>(rows * (w + 1) / workers_count));
+      next_start_row = std::min(rows, RoundUp<KernelFormat::kRows>(
+                                          rows * (thread + 1) / thread_count));
 
       int block_rows = next_start_row - start_row;
       auto lhs_block = lhs.block(start_row, 0, block_rows, depth);
       auto result_block = result->block(start_row, c, block_rows, cs);
-      typedef GemmWithPackedRhsTask<KernelFormat, Scalar, BitDepth, LhsOrder,
-                                    RhsOrder, ResultOrder> TaskType;
+      typedef GemmWithPackedRhsTask<KernelFormat, InputScalar, OutputScalar,
+                                    BitDepthParams, LhsOrder, RhsOrder,
+                                    ResultOrder, LhsOffset, RhsOffset,
+                                    OutputPipelineType>
+          TaskType;
       auto task = new TaskType(kernel, lhs_block, packed_rhs, &result_block,
-                               lhs_offset, rhs_offset, result_offset,
-                               result_mult_int, result_shift);
-      workers_pool->StartWorker(w, task);
+                               lhs_offset, rhs_offset, output_pipeline);
+      if (thread < workers_count) {
+        workers_pool->StartWorker(thread, task);
+      } else {
+        // Execute the remaining workload immediately on the current thread.
+        task->local_allocator = context->main_thread_task_allocator();
+        task->Run();
+        delete task;
+      }
     }
     // Wait for the workers.
     workers_pool->counter_to_decrement_when_ready().Wait();

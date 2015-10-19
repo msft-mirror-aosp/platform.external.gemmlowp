@@ -22,29 +22,37 @@
 
 #include "kernel.h"
 
-#include <cassert>
 #include <arm_neon.h>
+#include <cassert>
 
 namespace gemmlowp {
 
 // The kernels here are specifically arm 32bit assembly, not arm 64bit.
-#ifdef GEMMLOWP_NEON32
+#ifdef GEMMLOWP_NEON_32
 
 // Our main GEMM kernel.
-struct NEON32Kernel12x4Depth2 : KernelBase {
+struct NEON_32_Kernel12x4Depth2 : KernelBase {
   typedef KernelFormat<KernelSideFormat<CellFormat<4, 2>, 3>,
-                       KernelSideFormat<CellFormat<4, 2>, 1> > Format;
+                       KernelSideFormat<CellFormat<4, 2>, 1> >
+      Format;
 
   const char* Name() const override { return "NEON, 12x4, depth 2"; }
 
   // TODO(benoitjacob): reorder function arguments so dst comes last
-  void Run(std::int32_t* dst_ptr, int dst_row_stride, int dst_col_stride,
-           const std::uint8_t* lhs_ptr, const std::uint8_t* rhs_ptr,
-           int start_depth, int run_depth) const override {
+  void Run(std::int32_t* dst_ptr, std::size_t dst_row_stride,
+           std::size_t dst_col_stride, const std::uint8_t* lhs_ptr,
+           const std::uint8_t* rhs_ptr, std::size_t start_depth,
+           std::size_t run_depth) const override {
     ScopedProfilingLabel label("optimized kernel (NEON 12x4)");
 
-    assert(dst_row_stride == 1);
+// For iOS assembler, the %= style of local labels cause compilation errors,
+//  so use numerical ones instead. See
+// http://stackoverflow.com/questions/3898435/labels-in-gcc-inline-assembly
+// If you add any labels, remember to undef them at the end.
+#define GEMMLOWP_LOOP_NEON_KERNEL_12X4_DEPTH2 "1"
+#define GEMMLOWP_STORE_RESULT_NEON_KERNEL_12X4_DEPTH2 "2"
 
+    assert(dst_row_stride == 1);
     asm volatile(
         // Clear accumulator registers (see layout below)
         "vmov.s32 q4, #0\n"
@@ -62,7 +70,8 @@ struct NEON32Kernel12x4Depth2 : KernelBase {
 
         /* Main loop */
 
-        "loop_NEONKernel12x4Depth2_%=:\n"
+        GEMMLOWP_LOOP_NEON_KERNEL_12X4_DEPTH2
+        ":\n"
 
         // Overview of register layout:
         //
@@ -145,7 +154,8 @@ struct NEON32Kernel12x4Depth2 : KernelBase {
         // Loop. Decrement loop index (depth) by 2, since we just handled 2
         // levels of depth (Kernel::kDepth=2).
         "subs %[run_depth], #2\n"
-        "bne loop_NEONKernel12x4Depth2_%=\n"
+        "bne " GEMMLOWP_LOOP_NEON_KERNEL_12X4_DEPTH2
+        "b\n"
 
         /* end of main loop */
 
@@ -159,7 +169,8 @@ struct NEON32Kernel12x4Depth2 : KernelBase {
         // If start_depth == 0, then there is no preexisting accumulator
         // to accumulate, so we can simply store our result.
         "cmp %[start_depth], #0\n"
-        "beq store_result_NEONKernel12x4Depth2_%=\n"
+        "beq " GEMMLOWP_STORE_RESULT_NEON_KERNEL_12X4_DEPTH2
+        "f\n"
 
         "mov r0, %[dst_ptr]\n"
 
@@ -206,7 +217,8 @@ struct NEON32Kernel12x4Depth2 : KernelBase {
         "vadd.s32 q11, q11, q1\n"
         "vadd.s32 q15, q15, q2\n"
 
-        "store_result_NEONKernel12x4Depth2_%=:\n"
+        GEMMLOWP_STORE_RESULT_NEON_KERNEL_12X4_DEPTH2
+        ":\n"
 
         "mov r0, %[dst_ptr]\n"
         // Store a column
@@ -247,25 +259,38 @@ struct NEON32Kernel12x4Depth2 : KernelBase {
         "d11", "d12", "d13", "d14", "d15", "d16", "d17", "d18", "d19", "d20",
         "d21", "d22", "d23", "d24", "d25", "d26", "d27", "d28", "d29", "d30",
         "d31");
+#undef GEMMLOWP_LOOP_NEON_KERNEL_12X4_DEPTH2
+#undef GEMMLOWP_STORE_RESULT_NEON_KERNEL_12X4_DEPTH2
   }
 };
 
-struct NEON32Kernel12x4Depth2Assuming12BitProducts : KernelBase {
+struct NEON_32_Kernel12x4Depth2Assuming12BitProducts : KernelBase {
   typedef KernelFormat<
       KernelSideFormat<CellFormat<4, 2, CellOrder::WidthMajor>, 3>,
-      KernelSideFormat<CellFormat<4, 2, CellOrder::WidthMajor>, 1> > Format;
+      KernelSideFormat<CellFormat<4, 2, CellOrder::WidthMajor>, 1> >
+      Format;
 
   const char* Name() const override {
     return "NEON, 12x4, depth 2, assuming 12-bit products";
   }
 
   // TODO(benoitjacob): reorder function arguments so dst comes last
-  void Run(std::int32_t* dst_ptr, int dst_row_stride, int dst_col_stride,
-           const std::uint8_t* lhs_ptr, const std::uint8_t* rhs_ptr,
-           int start_depth, int run_depth) const override {
+  void Run(std::int32_t* dst_ptr, std::size_t dst_row_stride,
+           std::size_t dst_col_stride, const std::uint8_t* lhs_ptr,
+           const std::uint8_t* rhs_ptr, std::size_t start_depth,
+           std::size_t run_depth) const override {
     ScopedProfilingLabel label(
         "optimized kernel (NEON 12x4, assuming 12-bit products)");
     assert(dst_row_stride == 1);
+
+// See comments above for why we need local numerical labels in our asm.
+#define GEMMLOWP_LOOP_NEON_32_KERNEL_12X4_DEPTH2_ASSUMING_12BIT_PRODUCTS "1"
+#define GEMMLOWP_LOAD_GLOBAL_ACCUMULATORS_NEON_32_KERNEL_12X4_DEPTH2_12BIT "2"
+#define GEMMLOWP_LABEL_32 "3"
+#define GEMMLOWP_LABEL_24 "4"
+#define GEMMLOWP_LABEL_16 "5"
+#define GEMMLOWP_LABEL_8 "6"
+#define GEMMLOWP_LABEL_2 "7"
 
     // This kernel is special in that it uses local 16-bit accumulators.
     // Because it assumes that each product fits in 12 bits, it can accumulate
@@ -283,16 +308,15 @@ struct NEON32Kernel12x4Depth2Assuming12BitProducts : KernelBase {
     //
     // and likewise for the 2nd  cell (16--31) and 3rd cell (32--47)
     std::int32_t global_accumulators[3 * 4 * 4];
-
     asm volatile(
         // Compute stride between consecutive columns, in bytes
         "mov r0, #4\n"  // multiply by 4 = sizeof(int32)
         "mul %[dst_col_stride], r0\n"
 
         "cmp %[start_depth], #0\n"
-        "bne "
-        "load_global_accumulators_NEON32Kernel12x4Depth2Assuming12BitProducts_%"
-        "=\n"
+        "bne"
+        " " GEMMLOWP_LOAD_GLOBAL_ACCUMULATORS_NEON_32_KERNEL_12X4_DEPTH2_12BIT
+        "f\n"
 
         // If start_depth==0, we need to clear our global accumulators
         "mov r0, %[global_accumulators]\n"
@@ -304,11 +328,12 @@ struct NEON32Kernel12x4Depth2Assuming12BitProducts : KernelBase {
         "vst1.32 {d16,d17,d18,d19}, [r0]!\n"
         "vst1.32 {d16,d17,d18,d19}, [r0]!\n"
         "vst1.32 {d16,d17,d18,d19}, [r0]!\n"
-        "b loop_NEON32Kernel12x4Depth2Assuming12BitProducts_%=\n"
+        "b " GEMMLOWP_LOOP_NEON_32_KERNEL_12X4_DEPTH2_ASSUMING_12BIT_PRODUCTS
+        "f\n"
 
         // If start_depth!=0, we need to load our existing global accumulators
-        "load_global_accumulators_NEON32Kernel12x4Depth2Assuming12BitProducts_%"
-        "=:\n"
+        GEMMLOWP_LOAD_GLOBAL_ACCUMULATORS_NEON_32_KERNEL_12X4_DEPTH2_12BIT
+        ":\n"
         // Load global accumulators from destination matrix, column-major
         "mov r1, %[dst_ptr]\n"
         "mov r0, %[dst_col_stride]\n"
@@ -367,7 +392,8 @@ struct NEON32Kernel12x4Depth2Assuming12BitProducts : KernelBase {
 
         /* Main loop */
 
-        "loop_NEON32Kernel12x4Depth2Assuming12BitProducts_%=:\n"
+        GEMMLOWP_LOOP_NEON_32_KERNEL_12X4_DEPTH2_ASSUMING_12BIT_PRODUCTS
+        ":\n"
 
 // Overview of register layout:
 //
@@ -466,22 +492,27 @@ struct NEON32Kernel12x4Depth2Assuming12BitProducts : KernelBase {
         // to process at this iteration. TODO (benoitjacob) I guess that
         // someone who really knows asm should make this a jump table.
         "cmp %[run_depth], #32\n"
-        "bge label_32\n"
+        "bge " GEMMLOWP_LABEL_32
+        "f\n"
         "cmp %[run_depth], #24\n"
-        "bge label_24\n"
+        "bge " GEMMLOWP_LABEL_24
+        "f\n"
         "cmp %[run_depth], #16\n"
-        "bge label_16\n"
+        "bge " GEMMLOWP_LABEL_16
+        "f\n"
         "cmp %[run_depth], #8\n"
-        "bge label_8\n"
-        "b label_2\n"
+        "bge " GEMMLOWP_LABEL_8
+        "f\n"
+        "b " GEMMLOWP_LABEL_2 "f\n"
 
-        "label_32:\n" GEMMLOWP_ACCUMULATE_8_LEVELS_OF_DEPTH
-        "label_24:\n" GEMMLOWP_ACCUMULATE_8_LEVELS_OF_DEPTH
-        "label_16:\n" GEMMLOWP_ACCUMULATE_8_LEVELS_OF_DEPTH
-        "label_8:\n" GEMMLOWP_ACCUMULATE_2_LEVELS_OF_DEPTH
+        GEMMLOWP_LABEL_32
+        ":\n" GEMMLOWP_ACCUMULATE_8_LEVELS_OF_DEPTH GEMMLOWP_LABEL_24
+        ":\n" GEMMLOWP_ACCUMULATE_8_LEVELS_OF_DEPTH GEMMLOWP_LABEL_16
+        ":\n" GEMMLOWP_ACCUMULATE_8_LEVELS_OF_DEPTH GEMMLOWP_LABEL_8
+        ":\n" GEMMLOWP_ACCUMULATE_2_LEVELS_OF_DEPTH
             GEMMLOWP_ACCUMULATE_2_LEVELS_OF_DEPTH
-                GEMMLOWP_ACCUMULATE_2_LEVELS_OF_DEPTH
-        "label_2:\n" GEMMLOWP_ACCUMULATE_2_LEVELS_OF_DEPTH
+                GEMMLOWP_ACCUMULATE_2_LEVELS_OF_DEPTH GEMMLOWP_LABEL_2
+        ":\n" GEMMLOWP_ACCUMULATE_2_LEVELS_OF_DEPTH
 
         // Accumulate the local accumulators into the global accumulators.
         // This is about summing adjacent pairs of 16-bit scalars into
@@ -513,10 +544,10 @@ struct NEON32Kernel12x4Depth2Assuming12BitProducts : KernelBase {
         "vst1.32 {d0,d1,d2,d3}, [r1]!\n"
         "vst1.32 {d4,d5,d6,d7}, [r1]!\n"
 
-        // Loop. Decrement loop index (depth) by 16, since we just handled 16
-        // levels of depth (Kernel::kDepth=16).
+        // Loop.
         "cmp %[run_depth], #0\n"
-        "bne loop_NEON32Kernel12x4Depth2Assuming12BitProducts_%=\n"
+        "bne " GEMMLOWP_LOOP_NEON_32_KERNEL_12X4_DEPTH2_ASSUMING_12BIT_PRODUCTS
+        "b\n"
 
 #undef GEMMLOWP_CLEAR_LOCAL_ACCUMULATORS
 #undef GEMMLOWP_ACCUMULATE_8_LEVELS_OF_DEPTH
@@ -597,29 +628,40 @@ struct NEON32Kernel12x4Depth2Assuming12BitProducts : KernelBase {
         "d11", "d12", "d13", "d14", "d15", "d16", "d17", "d18", "d19", "d20",
         "d21", "d22", "d23", "d24", "d25", "d26", "d27", "d28", "d29", "d30",
         "d31");
+#undef GEMMLOWP_LOOP_NEON_32_KERNEL_12X4_DEPTH2_ASSUMING_12BIT_PRODUCTS
+#undef GEMMLOWP_LOAD_GLOBAL_ACCUMULATORS_NEON_32_KERNEL_12X4_DEPTH2_12BIT
+#undef GEMMLOWP_LABEL_32
+#undef GEMMLOWP_LABEL_24
+#undef GEMMLOWP_LABEL_16
+#undef GEMMLOWP_LABEL_8
+#undef GEMMLOWP_LABEL_2
   }
 };
 
-#endif  // GEMMLOWP_NEON32
+#endif  // GEMMLOWP_NEON_32
 
 // The kernels here are specifically arm 64bit assembly, not arm 32bit.
-#ifdef GEMMLOWP_NEON64
+#ifdef GEMMLOWP_NEON_64
 
 // Our main GEMM kernel.
-struct NEON64Kernel12x8Depth2 : KernelBase {
+struct NEON_64_Kernel12x8Depth2 : KernelBase {
   typedef KernelFormat<KernelSideFormat<CellFormat<4, 2>, 3>,
-                       KernelSideFormat<CellFormat<4, 2>, 2> > Format;
+                       KernelSideFormat<CellFormat<4, 2>, 2> >
+      Format;
 
   const char* Name() const override { return "NEON, 12x8, depth 2"; }
 
   // TODO(benoitjacob): reorder function arguments so dst comes last
-  void Run(std::int32_t* dst_ptr, int dst_row_stride, int dst_col_stride,
-           const std::uint8_t* lhs_ptr, const std::uint8_t* rhs_ptr,
-           int start_depth, int run_depth) const override {
+  void Run(std::int32_t* dst_ptr, std::size_t dst_row_stride,
+           std::size_t dst_col_stride, const std::uint8_t* lhs_ptr,
+           const std::uint8_t* rhs_ptr, std::size_t start_depth,
+           std::size_t run_depth) const override {
     ScopedProfilingLabel label("optimized kernel (NEON 12x8)");
+// See comments above for why we need local numerical labels in our asm.
+#define GEMMLOWP_LOOP_NEON_64_KERNEL_12X8_DEPTH2 "1"
+#define GEMMLOWP_STORE_RESULT_NEON_64_KERNEL_12x8_DEPTH2 "2"
 
     assert(dst_row_stride == 1);
-
     asm volatile(
         // Clear accumulator registers (see layout below)
         "dup v8.4s, wzr\n"
@@ -649,7 +691,8 @@ struct NEON64Kernel12x8Depth2 : KernelBase {
 
         /* Main loop */
 
-        "loop_NEON64Kernel12x8Depth2_%=:\n"
+        GEMMLOWP_LOOP_NEON_64_KERNEL_12X8_DEPTH2
+        ":\n"
 
         // Overview of register layout:
         //
@@ -757,7 +800,8 @@ struct NEON64Kernel12x8Depth2 : KernelBase {
         // Loop. Decrement loop index (depth) by 2, since we just handled 2
         // levels of depth (Kernel::kDepth=2).
         "subs %[run_depth], %[run_depth], #2\n"
-        "bne loop_NEON64Kernel12x8Depth2_%=\n"
+        "bne " GEMMLOWP_LOOP_NEON_64_KERNEL_12X8_DEPTH2
+        "b\n"
 
         /* end of main loop */
 
@@ -771,7 +815,8 @@ struct NEON64Kernel12x8Depth2 : KernelBase {
         // If start_depth == 0, then there is no preexisting accumulator
         // to accumulate, so we can simply store our result.
         "cmp %[start_depth], #0\n"
-        "beq store_result_NEON64Kernel12x8Depth2_%=\n"
+        "beq " GEMMLOWP_STORE_RESULT_NEON_64_KERNEL_12x8_DEPTH2
+        "f\n"
 
         "mov x0, %[dst_ptr]\n"
 
@@ -862,7 +907,8 @@ struct NEON64Kernel12x8Depth2 : KernelBase {
         "add v23.4s, v23.4s, v1.4s\n"
         "add v31.4s, v31.4s, v2.4s\n"
 
-        "store_result_NEON64Kernel12x8Depth2_%=:\n"
+        GEMMLOWP_STORE_RESULT_NEON_64_KERNEL_12x8_DEPTH2
+        ":\n"
 
         "mov x0, %[dst_ptr]\n"
         // Store a column
@@ -924,10 +970,12 @@ struct NEON64Kernel12x8Depth2 : KernelBase {
         "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
         "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26",
         "v27", "v28", "v29", "v30", "v31");
+#undef GEMMLOWP_LOOP_NEON_64_KERNEL_12X8_DEPTH2
+#undef GEMMLOWP_STORE_RESULT_NEON_64_KERNEL_12x8_DEPTH2
   }
 };
 
-#endif  // GEMMLOWP_NEON64
+#endif  // GEMMLOWP_NEON_64
 
 // Our main GEMV kernel.
 // Because our GEMV performance is low and not dominated by the kernel
@@ -941,13 +989,15 @@ struct NEON64Kernel12x8Depth2 : KernelBase {
 template <int Cells>
 struct NEONKernel4Nx1Depth2 : KernelBase {
   typedef KernelFormat<KernelSideFormat<CellFormat<4, 2>, Cells>,
-                       KernelSideFormat<CellFormat<1, 2>, 1> > Format;
+                       KernelSideFormat<CellFormat<1, 2>, 1> >
+      Format;
 
   const char* Name() const override { return "NEON intrinsics, 4Nx1, depth 2"; }
 
-  void Run(std::int32_t* dst_ptr, int dst_row_stride, int dst_col_stride,
-           const std::uint8_t* lhs_ptr, const std::uint8_t* rhs_ptr,
-           int start_depth, int run_depth) const override {
+  void Run(std::int32_t* dst_ptr, std::size_t dst_row_stride,
+           std::size_t dst_col_stride, const std::uint8_t* lhs_ptr,
+           const std::uint8_t* rhs_ptr, std::size_t start_depth,
+           std::size_t run_depth) const override {
     ScopedProfilingLabel label("optimized kernel (NEON 4Nx1)");
 
     assert(dst_row_stride == 1);
@@ -958,7 +1008,7 @@ struct NEONKernel4Nx1Depth2 : KernelBase {
       acc[cell] = vdupq_n_u32(0);
     }
     // Main loop
-    for (int d = 0; d < run_depth; d += 2) {
+    for (std::size_t d = 0; d < run_depth; d += 2) {
       // Load LHS cells
       uint16x8_t lhs[Cells];
       for (int cell = 0; cell < Cells; cell++) {

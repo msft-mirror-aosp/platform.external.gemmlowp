@@ -40,6 +40,6 @@ endif
 LOCAL_CFLAGS += -std=c++11
 LOCAL_CFLAGS += -DGEMMLOWP_USE_STLPORT
 LOCAL_C_INCLUDES += external/gemmlowp/
-LOCAL_NDK_STL_VARIANT := stlport_static
+LOCAL_NDK_STL_VARIANT := c++_static
 
 include $(BUILD_STATIC_LIBRARY)
