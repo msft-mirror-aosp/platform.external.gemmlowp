@@ -29,7 +29,7 @@ include $(CLEAR_VARS)
 LOCAL_CLANG := true
 LOCAL_MODULE := libbnnmlowpV8
 
-LOCAL_SDK_VERSION := 8
+LOCAL_SDK_VERSION := 9
 LOCAL_CPP_EXTENSION := .cc
 LOCAL_SRC_FILES:= eight_bit_int_gemm.cc
 
