@@ -73,6 +73,8 @@ inline void WriteBarrier() {
   asm volatile("dmb ishst" ::: "memory");
 #elif defined(GEMMLOWP_X86)
   asm volatile("sfence" ::: "memory");
+#elif defined(__mips__)
+  MemoryBarrier();
 #else
 #error "Unsupported architecture for WriteBarrier."
 #endif
@@ -85,6 +87,8 @@ inline void ReadBarrier() {
   asm volatile("dmb ishld" ::: "memory");
 #elif defined(GEMMLOWP_X86)
   asm volatile("lfence" ::: "memory");
+#elif defined(__mips__)
+  MemoryBarrier();
 #else
 #error "Unsupported architecture for ReadBarrier."
 #endif
