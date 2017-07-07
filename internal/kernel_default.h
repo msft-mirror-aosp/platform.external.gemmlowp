@@ -18,6 +18,10 @@
 #ifndef GEMMLOWP_INTERNAL_KERNEL_DEFAULT_H_
 #define GEMMLOWP_INTERNAL_KERNEL_DEFAULT_H_
 
+#ifndef GEMMLOWP_ALLOW_SLOW_SCALAR_FALLBACK
+#define GEMMLOWP_ALLOW_SLOW_SCALAR_FALLBACK
+#endif
+
 #include "../public/bit_depth.h"
 #include "common.h"
 #include "kernel_reference.h"
