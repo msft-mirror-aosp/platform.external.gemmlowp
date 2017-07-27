@@ -12,4 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+cc_library_headers {
+    name: "libfixedpoint",
+    host_supported: true,
+    export_include_dirs: ["fixedpoint"],
+}
+
+cc_library_headers {
+    name: "libgemmlowp",
+    host_supported: true,
+    export_include_dirs: ["public"],
+}
+
 subdirs = ["eight_bit_int_gemm"]

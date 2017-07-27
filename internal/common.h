@@ -117,7 +117,7 @@
 // Detect Android. Don't conflate with ARM - we care about tuning
 // for non-ARM Android devices too. This can be used in conjunction
 // with x86 to tune differently for mobile x86 CPUs (Atom) vs. desktop x86 CPUs.
-#if defined(__ANDROID__) || defined(ANDROID)
+#if defined(__ANDROID__)
 #define GEMMLOWP_ANDROID
 #endif
 
