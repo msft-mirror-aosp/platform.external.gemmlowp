@@ -18,7 +18,8 @@
 #ifndef GEMMLOWP_INTERNAL_COMMON_H_
 #define GEMMLOWP_INTERNAL_COMMON_H_
 
-#include <pthread.h>
+#include "../internal/platform.h"
+#include "../profiling/pthread_everywhere.h"
 
 #include <algorithm>
 #include <cassert>
@@ -112,12 +113,22 @@
 #define GEMMLOWP_SSE3_64
 #endif
 
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#define GEMMLOWP_MARK_MEMORY_AS_INITIALIZED __msan_unpoison
+#elif __has_feature(address_sanitizer)
+#include <sanitizer/asan_interface.h>
+#define GEMMLOWP_MARK_MEMORY_AS_INITIALIZED __asan_unpoison_memory_region
+#endif
+#endif
+
 #endif  // GEMMLOWP_ALLOW_INLINE_ASM
 
 // Detect Android. Don't conflate with ARM - we care about tuning
 // for non-ARM Android devices too. This can be used in conjunction
 // with x86 to tune differently for mobile x86 CPUs (Atom) vs. desktop x86 CPUs.
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(ANDROID)
 #define GEMMLOWP_ANDROID
 #endif
 
@@ -205,7 +216,7 @@ inline void Prefetch(const void* ptr) {
   // leaving __builtin_prefetch a no-op on this architecture.
   // For our purposes, "pldl1keep" is usually what we want, meaning:
   // "prefetch for load, into L1 cache, using each value multiple times".
-  asm volatile("prfm pldl1keep, [%[ptr]]\n" ::[ptr] "r"(ptr) : );
+  asm volatile("prfm pldl1keep, [%[ptr]]\n" ::[ptr] "r"(ptr) :);
 #elif defined \
     __GNUC__  // Clang and GCC define __GNUC__ and have __builtin_prefetch.
   __builtin_prefetch(ptr);
@@ -250,6 +261,17 @@ template <int N>
 struct IsPowerOfTwo {
   static const bool value = !(N & (N - 1));
 };
+
+template <typename T>
+void MarkMemoryAsInitialized(T* ptr, int size) {
+#ifdef GEMMLOWP_MARK_MEMORY_AS_INITIALIZED
+  GEMMLOWP_MARK_MEMORY_AS_INITIALIZED(static_cast<void*>(ptr),
+                                      size * sizeof(T));
+#else
+  (void)ptr;
+  (void)size;
+#endif
+}
 
 }  // namespace gemmlowp
 
