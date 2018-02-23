@@ -149,9 +149,7 @@ T WaitForVariableChange(volatile T* var, T initial_value, pthread_cond_t* cond,
 // to have finished working.
 class BlockingCounter {
  public:
-  BlockingCounter()
-      : count_(0),
-        initial_count_(0) {
+  BlockingCounter() : count_(0), initial_count_(0) {
     pthread_cond_init(&cond_, nullptr);
     pthread_mutex_init(&mutex_, nullptr);
   }
@@ -547,11 +545,6 @@ class MultiThreadGemmContext : public MultiThreadGemmContextBase {
   // avoiding recreating threads on every Gemm.
   WorkersPool workers_pool_;
 };
-
-// Needed by chrome native builds
-#ifndef _SC_NPROCESSORS_CONF
-#define _SC_NPROCESSORS_CONF _SC_NPROCESSORS_ONLN
-#endif
 
 // Determines how many threads should be used for a given Gemm
 // operation.
