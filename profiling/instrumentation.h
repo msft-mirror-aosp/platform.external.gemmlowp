@@ -24,7 +24,6 @@
 #ifndef GEMMLOWP_PROFILING_INSTRUMENTATION_H_
 #define GEMMLOWP_PROFILING_INSTRUMENTATION_H_
 
-#include <pthread.h>
 #include <cstdio>
 
 #ifndef GEMMLOWP_USE_STLPORT
@@ -32,15 +31,15 @@
 #else
 #include <stdint.h>
 namespace std {
-using ::uint8_t;
-using ::uint16_t;
-using ::uint32_t;
-using ::int8_t;
 using ::int16_t;
 using ::int32_t;
+using ::int8_t;
 using ::size_t;
+using ::uint16_t;
+using ::uint32_t;
+using ::uint8_t;
 using ::uintptr_t;
-}
+}  // namespace std
 #endif
 
 #include <algorithm>
@@ -51,6 +50,8 @@ using ::uintptr_t;
 #include <cstring>
 #include <set>
 #endif
+
+#include "./pthread_everywhere.h"
 
 namespace gemmlowp {
 

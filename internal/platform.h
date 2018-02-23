@@ -17,17 +17,20 @@
 #ifndef GEMMLOWP_INTERNAL_PLATFORM_H_
 #define GEMMLOWP_INTERNAL_PLATFORM_H_
 
-
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <unistd.h>
-#include <time.h>
 #include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 #endif
-#include <malloc.h>
+
+#ifdef __APPLE__
+#include <sys/time.h>
+#endif
 
 #if defined ANDROID || defined __ANDROID__
+#include <malloc.h>
 #include <android/api-level.h>
 // The 18 here should be 16, but has to be 18 for now due
 // to a Google-internal issue.
@@ -42,6 +45,10 @@
 #endif
 #endif
 
+// Needed by chrome native builds
+#ifndef _SC_NPROCESSORS_CONF
+#define _SC_NPROCESSORS_CONF _SC_NPROCESSORS_ONLN
+#endif
 
 namespace gemmlowp {
 
@@ -50,9 +57,7 @@ inline void *aligned_alloc(size_t alignment, size_t size) {
   return _aligned_malloc(size, alignment);
 }
 
-inline void aligned_free(void *memptr) {
-  _aligned_free(memptr);
-}
+inline void aligned_free(void *memptr) { _aligned_free(memptr); }
 
 inline int GetHardwareConcurrency(int max_threads) {
   if (max_threads == 0) {
@@ -64,8 +69,9 @@ inline int GetHardwareConcurrency(int max_threads) {
 }
 
 inline double real_time_in_seconds() {
-  __int64 wintime; GetSystemTimeAsFileTime((FILETIME*)&wintime);
-  wintime -= 116444736000000000i64;	            //1jan1601 to 1jan1970
+  __int64 wintime;
+  GetSystemTimeAsFileTime((FILETIME *)&wintime);
+  wintime -= 116444736000000000i64;  // 1jan1601 to 1jan1970
   return wintime / 10000000i64 + wintime % 10000000i64 * 100 * 1e-9;
 }
 
@@ -91,9 +97,7 @@ inline int GetHardwareConcurrency(int max_threads) {
   return max_threads;
 }
 
-inline void aligned_free(void *memptr) {
-  free(memptr);
-}
+inline void aligned_free(void *memptr) { free(memptr); }
 
 inline double real_time_in_seconds() {
 #ifdef __APPLE__
@@ -108,5 +112,5 @@ inline double real_time_in_seconds() {
 }
 
 #endif
-} // namespace gemmlowp
+}  // namespace gemmlowp
 #endif  // GEMMLOWP_INTERNAL_PLATFORM_H_
