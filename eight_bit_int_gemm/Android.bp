@@ -37,6 +37,8 @@ cc_library_static {
 
 cc_library_static {
     name: "libbnnmlowpV8",
+    // TODO(b/153609531): remove when no longer needed.
+    native_bridge_supported: true,
     defaults: ["libbnnmlowp-defaults"],
 
     sdk_version: "9",
