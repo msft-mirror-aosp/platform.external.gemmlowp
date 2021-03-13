@@ -30,8 +30,7 @@
 #include <sys/time.h>
 #endif
 
-#if defined __ANDROID__
-#include <android/api-level.h>
+#if defined ANDROID || defined __ANDROID__
 #include <malloc.h>
 // The 18 here should be 16, but has to be 18 for now due
 // to a Google-internal issue.
