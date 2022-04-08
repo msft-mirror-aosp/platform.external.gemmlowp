@@ -32,6 +32,7 @@
 
 #if defined ANDROID || defined __ANDROID__
 #include <malloc.h>
+#include <android/api-level.h>
 // The 18 here should be 16, but has to be 18 for now due
 // to a Google-internal issue.
 #if __ANDROID_API__ < 18

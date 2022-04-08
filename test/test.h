@@ -49,7 +49,7 @@ class Matrix : public MatrixMap<tScalar, tOrder> {
   typedef MatrixMap<tScalar, tOrder> Map;
   typedef MatrixMap<const tScalar, tOrder> ConstMap;
   typedef typename Map::Scalar Scalar;
-  static constexpr MapOrder Order = tOrder;
+  static const MapOrder Order = tOrder;
   using Map::kOrder;
   using Map::rows_;
   using Map::cols_;
@@ -92,12 +92,12 @@ class Matrix : public MatrixMap<tScalar, tOrder> {
   std::vector<Scalar> storage;
 };
 
-inline std::mt19937& RandomEngine() {
+std::mt19937& RandomEngine() {
   static std::mt19937 engine;
   return engine;
 }
 
-inline int Random() {
+int Random() {
   std::uniform_int_distribution<int> dist(0, std::numeric_limits<int>::max());
   return dist(RandomEngine());
 }
