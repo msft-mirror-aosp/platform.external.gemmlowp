@@ -56,7 +56,6 @@ cc_library_headers {
     export_include_dirs: ["."],
     apex_available: [
         "com.android.neuralnetworks",
-        "test_com.android.neuralnetworks",
         "//apex_available:platform",
     ],
     sdk_version: "current",
